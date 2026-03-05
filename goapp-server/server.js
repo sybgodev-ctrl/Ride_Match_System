@@ -30,10 +30,11 @@ const pricingService = require('./services/pricing-service');
 const rideService = require('./services/ride-service');
 const redis = require('./services/redis-mock');
 const WebSocketServer = require('./websocket/ws-gateway');
-const { haversine, bearing, calculateCompositeScore, detectSpoofing } = require('./utils/formulas');
+const { haversine, bearing } = require('./utils/formulas');
 
 // Test Data
-const { generateDrivers, generateRiders, generateRideScenarios, chennaiLocations } = require('./data/test-data');
+const mockDb = require('./services/mock-db');
+const enterprise = require('./config/enterprise-architecture');
 
 // ─── REST API Server ───
 function startAPIServer(port) {
@@ -109,6 +110,8 @@ async function handleRoute(method, path, body, params) {
       location: locationService.getStats(),
       pricing: pricingService.getStats(),
       rides: rideService.getStats(),
+      mockDb: mockDb.getStats(),
+      deployment: enterprise.runtime,
     }};
   }
 
@@ -204,6 +207,8 @@ async function handleRoute(method, path, body, params) {
       location: locationService.getStats(),
       pricing: pricingService.getStats(),
       rides: rideService.getStats(),
+      mockDb: mockDb.getStats(),
+      deployment: enterprise.runtime,
       events: { total: eventBus.events.length },
     }};
   }
@@ -246,14 +251,14 @@ async function main() {
   console.log('');
 
   if (!simOnly) {
-    // Setup test data for API mode
-    const drivers = generateDrivers(20);
-    drivers.forEach(d => {
-      matchingEngine.registerDriver(d);
-      locationService.updateLocation(d.driverId, {
-        lat: d.lat, lng: d.lng, speed: d.speed, heading: d.heading,
-      });
-    });
+    // Warm-start using deterministic in-memory repository (future DB swap point)
+    const seeded = mockDb.seed({ driverCount: 20, riderCount: 10 });
+    const drivers = seeded.drivers;
+    drivers.forEach(d => matchingEngine.registerDriver(d));
+    locationService.bulkLoadLocations(drivers, { publishEvents: false });
+
+    logger.info('BOOT', `Warm-start complete for ${enterprise.runtime.serviceName} in ${enterprise.runtime.region}`,
+      { drivers: seeded.driverCount, riders: seeded.riderCount, mode: enterprise.runtime.nodeEnv });
 
     // Start REST API
     startAPIServer(config.server.port);
