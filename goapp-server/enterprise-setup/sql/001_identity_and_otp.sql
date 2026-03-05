@@ -1,7 +1,14 @@
--- GoApp enterprise bootstrap schema (identity + OTP core)
+-- ============================================================
+-- GoApp Enterprise Schema: 001 - Identity & OTP Service
+-- Domain: Identity Service (17 tables)
 -- Aligned to: GoApp-Enterprise-Architecture-248-Tables-OTP-Login.md
+-- ============================================================
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+-- ──────────────────────────────────────────────────────
+-- Core User Tables
+-- ──────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS users (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -37,6 +44,28 @@ CREATE TABLE IF NOT EXISTS user_profiles (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_user_profiles_user ON user_profiles(user_id);
 
+CREATE TABLE IF NOT EXISTS user_roles (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id             UUID NOT NULL REFERENCES users(id),
+    role                VARCHAR(50) NOT NULL,
+    granted_by          UUID REFERENCES users(id),
+    granted_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at          TIMESTAMPTZ,
+    is_active           BOOLEAN DEFAULT true,
+    UNIQUE(user_id, role)
+);
+
+CREATE TABLE IF NOT EXISTS user_status_history (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id             UUID NOT NULL REFERENCES users(id),
+    old_status          VARCHAR(20),
+    new_status          VARCHAR(20) NOT NULL,
+    reason              TEXT,
+    changed_by          UUID REFERENCES users(id),
+    changed_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_user_status_history_user ON user_status_history(user_id);
+
 CREATE TABLE IF NOT EXISTS user_devices (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id             UUID NOT NULL REFERENCES users(id),
@@ -48,12 +77,12 @@ CREATE TABLE IF NOT EXISTS user_devices (
     fcm_token           TEXT,
     apns_token          TEXT,
     is_active           BOOLEAN DEFAULT true,
-    last_seen_at        TIMESTAMPTZ,
+    last_active_at      TIMESTAMPTZ,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(user_id, device_id)
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_user_devices_user ON user_devices(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_devices_fcm ON user_devices(fcm_token);
 
 CREATE TABLE IF NOT EXISTS user_sessions (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -70,6 +99,52 @@ CREATE TABLE IF NOT EXISTS user_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_user_sessions_token ON user_sessions(session_token);
 CREATE INDEX IF NOT EXISTS idx_user_sessions_user ON user_sessions(user_id);
+
+CREATE TABLE IF NOT EXISTS user_login_history (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id             UUID NOT NULL REFERENCES users(id),
+    login_method        VARCHAR(30) NOT NULL CHECK (login_method IN ('otp')),
+    ip_address          INET,
+    device_id           UUID REFERENCES user_devices(id),
+    status              VARCHAR(20) NOT NULL CHECK (status IN ('success','failed','blocked')),
+    failure_reason      TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_login_history_user ON user_login_history(user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS user_blocklist (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id             UUID NOT NULL REFERENCES users(id),
+    blocked_user_id     UUID NOT NULL REFERENCES users(id),
+    reason              TEXT,
+    blocked_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(user_id, blocked_user_id)
+);
+
+CREATE TABLE IF NOT EXISTS user_preferences (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id             UUID NOT NULL REFERENCES users(id),
+    preference_key      VARCHAR(100) NOT NULL,
+    preference_value    JSONB NOT NULL,
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(user_id, preference_key)
+);
+
+CREATE TABLE IF NOT EXISTS user_security_logs (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id             UUID NOT NULL REFERENCES users(id),
+    event_type          VARCHAR(50) NOT NULL,
+    event_detail        JSONB,
+    ip_address          INET,
+    device_id           UUID REFERENCES user_devices(id),
+    risk_level          VARCHAR(10) CHECK (risk_level IN ('low','medium','high','critical')),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_security_logs_user ON user_security_logs(user_id, created_at DESC);
+
+-- ──────────────────────────────────────────────────────
+-- OTP Authentication Tables
+-- ──────────────────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS otp_requests (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -106,3 +181,32 @@ CREATE TABLE IF NOT EXISTS otp_rate_limits (
     UNIQUE(phone_number, window_start)
 );
 CREATE INDEX IF NOT EXISTS idx_otp_rate_phone ON otp_rate_limits(phone_number);
+
+-- ──────────────────────────────────────────────────────
+-- Security Tables
+-- ──────────────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS user_api_keys (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id             UUID NOT NULL REFERENCES users(id),
+    key_hash            VARCHAR(512) NOT NULL,
+    key_prefix          VARCHAR(10) NOT NULL,
+    label               VARCHAR(100),
+    permissions         JSONB DEFAULT '[]',
+    is_active           BOOLEAN DEFAULT true,
+    last_used_at        TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at          TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS user_permissions (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id             UUID NOT NULL REFERENCES users(id),
+    resource            VARCHAR(100) NOT NULL,
+    action              VARCHAR(50) NOT NULL,
+    conditions          JSONB,
+    granted_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(user_id, resource, action)
+);
+
+-- Identity Service: 17 tables total

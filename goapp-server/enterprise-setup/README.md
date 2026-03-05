@@ -1,49 +1,75 @@
-# GoApp Enterprise Setup (Aligned to Architecture Doc)
+# GoApp Enterprise Setup
 
-This setup operationalizes the core infra from `GoApp-Enterprise-Architecture-248-Tables-OTP-Login.md`:
-- PostgreSQL for identity/OTP domain bootstrap
-- Redis for cache/geo/lock migration path
-- Kafka for event bus migration path
+Complete enterprise infrastructure aligned to `GoApp-Enterprise-Architecture-248-Tables-OTP-Login.md`.
 
-## 1) Start infrastructure
+## Architecture Overview
+
+```
+248 tables across 20 service domains:
+
+ Identity (17) → Driver (22) → Rider (10) → Ride Core (28)
+ Dispatch/Matching (18) → Location (12) → Pricing (14)
+ Payment+Wallet (20) → Incentives (12) → Notifications (8)
+ Fraud/Risk (12) → Promotions (12) → Safety/SOS (8)
+ Scheduling (5) → Corporate (6) → Support (8)
+ Compliance (6) → Saga (4) → Events (4) → Analytics (22)
+```
+
+## Quick Start
+
+### 1) Start infrastructure
 
 ```bash
 cd goapp-server/enterprise-setup
 docker compose up -d
 ```
 
-## 2) Verify infrastructure
+This starts:
+- **PostgreSQL 16 + PostGIS** on `localhost:5432` (database: `goapp_enterprise`)
+- **Redis 7** on `localhost:6379`
+- **Kafka 3.7** on `localhost:9092`
+- **Zookeeper 3.9** on `localhost:2181`
+
+### 2) Verify infrastructure
 
 ```bash
 docker compose ps
 ```
 
-You should see healthy containers:
-- `goapp-postgres` on `5432`
-- `goapp-redis` on `6379`
-- `goapp-zookeeper` on `2181`
-- `goapp-kafka` on `9092`
+All containers should show healthy status.
 
-## 3) Initialize Kafka topics
+### 3) Schema bootstrap (automatic)
 
-```bash
-./scripts/init-topics.sh
-```
+On first startup, PostgreSQL auto-loads all 20 SQL migration files from `./sql/` in alphabetical order, creating all 248 tables.
 
-## 4) SQL schema bootstrap
-
-Postgres auto-loads SQL files in `./sql` on first startup.
-Included file:
-- `001_identity_and_otp.sql` (users, sessions, OTP requests/attempts/rate-limits and supporting tables)
-
-If you already had a volume, recreate postgres volume to re-run init scripts:
+If you need to re-run migrations (reset database):
 
 ```bash
 docker compose down -v
 docker compose up -d
 ```
 
-## 5) Run app in current mode (in-memory runtime + enterprise-ready config)
+### 4) Manual migration (existing database)
+
+```bash
+cd sql
+./run-migrations.sh
+```
+
+Environment variables:
+- `DB_HOST` (default: localhost)
+- `DB_PORT` (default: 5432)
+- `DB_NAME` (default: goapp_enterprise)
+- `DB_USER` (default: goapp)
+- `DB_PASS` (default: goapp)
+
+### 5) Initialize Kafka topics
+
+```bash
+./scripts/init-topics.sh
+```
+
+### 6) Run the application
 
 ```bash
 cd ..
@@ -51,7 +77,7 @@ cp .env.example .env
 node server.js --api-only
 ```
 
-## 6) Validate endpoints
+### 7) Validate endpoints
 
 ```bash
 curl http://localhost:3000/api/v1/health
@@ -62,16 +88,49 @@ curl -X POST http://localhost:3000/api/v1/auth/otp/request \
   -d '{"phoneNumber":"+919876543210","otpType":"login"}'
 ```
 
----
+## SQL Migration Files
 
-## Coverage vs architecture doc
+| File | Domain | Tables |
+|------|--------|--------|
+| `001_identity_and_otp.sql` | Identity Service | 17 |
+| `002_driver_service.sql` | Driver + Vehicle | 22 |
+| `003_rider_service.sql` | Rider | 10 |
+| `004_ride_service.sql` | Ride Core | 28 |
+| `005_dispatch_matching.sql` | Dispatch/Matching Engine | 18 |
+| `006_location_service.sql` | Location (PostGIS) | 12 |
+| `007_pricing_service.sql` | Pricing + Surge | 14 |
+| `008_payment_wallet.sql` | Payment + Wallet | 20 |
+| `009_driver_incentives.sql` | Driver Incentives | 12 |
+| `010_notification_service.sql` | Notifications | 8 |
+| `011_fraud_risk.sql` | Fraud & Risk | 12 |
+| `012_promotions_referrals.sql` | Promotions & Referrals | 12 |
+| `013_safety_sos.sql` | Safety / SOS | 8 |
+| `014_scheduling.sql` | Scheduling | 5 |
+| `015_corporate_b2b.sql` | Corporate B2B | 6 |
+| `016_support.sql` | Support | 8 |
+| `017_compliance.sql` | Compliance | 6 |
+| `018_saga_orchestration.sql` | Saga Orchestration | 4 |
+| `019_event_system.sql` | Event System | 4 |
+| `020_analytics_warehouse.sql` | Analytics/DW | 22 |
+| **Total** | **20 domains** | **248** |
 
-Implemented here now:
-- Identity + OTP persistent schema bootstrap
-- External Redis/Kafka local stack for migration
-- Topic initialization script for event contracts
+## Current Implementation Status
 
-Still staged (next phase):
-- Replace in-memory repositories with PostgreSQL repositories
-- Replace local event bus with Kafka producers/consumers in app code
-- Split runtime into separate deployable services by `SERVICE_NAME`
+### Implemented (In-Memory, Production-Grade Logic)
+- OTP-based identity service
+- Multi-stage ride matching engine (3 stages, composite scoring)
+- Real-time driver location tracking (Redis GEO)
+- Surge pricing with EMA smoothing
+- Fare calculation with 4 vehicle type rate cards
+- Ride lifecycle state machine
+- GPS spoofing detection
+- WebSocket real-time updates
+- Event bus (Kafka-compatible)
+- Distributed locks (SETNX pattern)
+
+### Next Phase (Database Migration)
+- Replace in-memory Maps with PostgreSQL repositories
+- Replace Redis mock with real ElastiCache Redis
+- Replace event bus with MSK Kafka producers/consumers
+- Split into separate deployable services by `SERVICE_NAME`
+- Implement Payment, Fraud, Safety, Notification services
