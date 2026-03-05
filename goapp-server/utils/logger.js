@@ -1,6 +1,7 @@
 // GoApp Logger & Event Bus
 
 const { EventEmitter } = require('events');
+const crypto = require('crypto');
 
 // ─── Color Logger ───
 const colors = {
@@ -90,7 +91,6 @@ class EventBus extends EventEmitter {
   }
 }
 
-const crypto = require('crypto');
 const eventBus = new EventBus();
 
 module.exports = { logger, eventBus };
