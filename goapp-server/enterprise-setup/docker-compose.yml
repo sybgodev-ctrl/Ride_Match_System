@@ -2,20 +2,20 @@ version: '3.9'
 
 services:
   postgres:
-    image: postgres:16
+    image: postgis/postgis:16-3.4
     container_name: goapp-postgres
     restart: unless-stopped
     environment:
       POSTGRES_USER: goapp
       POSTGRES_PASSWORD: goapp
-      POSTGRES_DB: goapp_identity
+      POSTGRES_DB: goapp_enterprise
     ports:
       - "5432:5432"
     volumes:
       - pg_data:/var/lib/postgresql/data
       - ./sql:/docker-entrypoint-initdb.d
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U goapp -d goapp_identity"]
+      test: ["CMD-SHELL", "pg_isready -U goapp -d goapp_enterprise"]
       interval: 10s
       timeout: 5s
       retries: 10
