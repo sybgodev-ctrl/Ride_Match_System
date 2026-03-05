@@ -230,22 +230,41 @@ class RideService {
     } else if (cancelledBy === 'driver') {
       // Driver cancels after accepting
       const lastStage = ride.matchResult?.stage || 1;
+      const cancelledDriverId = ride.driverId;
 
       // Exclude this driver from re-matching
-      matchingEngine.excludeDriver(rideId, ride.driverId);
+      matchingEngine.excludeDriver(rideId, cancelledDriverId);
 
       // Free the driver
-      const driver = matchingEngine.getDriver(ride.driverId);
+      const driver = matchingEngine.getDriver(cancelledDriverId);
       if (driver) driver.status = 'online';
       redis.releaseLock(rideId);
 
       this._updateStatus(rideId, S.CANCELLED_BY_DRIVER);
-      eventBus.publish('ride_cancelled_by_driver', { rideId, driverId: ride.driverId });
+      eventBus.publish('ride_cancelled_by_driver', { rideId, driverId: cancelledDriverId });
 
       // Track driver cancellations
       penalty = this._trackCancellation('driver', userId);
 
-      logger.warn('RIDE', `Driver cancelled ride ${rideId} - will resume matching from stage ${lastStage}`);
+      logger.warn('RIDE', `Driver cancelled ride ${rideId} - resuming matching from stage ${lastStage}`);
+
+      // Resume matching asynchronously so the rider isn't left stranded
+      ride.driverId = null;
+      this._updateStatus(rideId, S.MATCHING);
+      matchingEngine.resumeMatching(ride, lastStage).then(matchResult => {
+        if (matchResult.success) {
+          ride.driverId = matchResult.driverId;
+          ride.acceptedAt = Date.now();
+          ride.matchResult = matchResult;
+          this._updateStatus(rideId, S.ACCEPTED);
+          this._updateStatus(rideId, S.DRIVER_ARRIVING);
+        } else {
+          this._updateStatus(rideId, S.NO_DRIVERS);
+        }
+      }).catch(err => {
+        logger.error('RIDE', `Re-matching failed for ride ${rideId}: ${err.message}`);
+        this._updateStatus(rideId, S.NO_DRIVERS);
+      });
     }
 
     ride.cancelledAt = now;

@@ -30,7 +30,7 @@ class MatchingEngine {
   // ═══════════════════════════════════════════
   // MAIN MATCHING FLOW
   // ═══════════════════════════════════════════
-  async startMatching(ride) {
+  async startMatching(ride, fromStage = 1) {
     const { rideId, pickupLat, pickupLng, rideType } = ride;
 
     logger.divider(`MATCHING STARTED: Ride ${rideId}`);
@@ -47,14 +47,15 @@ class MatchingEngine {
 
     eventBus.publish('ride_matching_started', { rideId, rideType: ride.rideType });
 
-    // Iterate through stages
-    for (let i = 0; i < config.matching.stages.length; i++) {
+    // Iterate through stages (optionally starting from a given stage)
+    const stages = config.matching.stages.filter(s => s.stage >= fromStage);
+    for (let i = 0; i < stages.length; i++) {
       if (matchState.cancelled) {
         logger.warn('MATCHING', `Ride ${rideId} cancelled during matching`);
         return { success: false, reason: 'CANCELLED' };
       }
 
-      const stage = config.matching.stages[i];
+      const stage = stages[i];
       matchState.currentStage = stage.stage;
 
       logger.info('MATCHING', `\n  ┌─ Stage ${stage.stage}: ${stage.radiusKm}km radius, max ${stage.maxDrivers} drivers, ${stage.timeoutSec}s timeout`);
@@ -244,7 +245,7 @@ class MatchingEngine {
             etaMin: winner.etaMin,
             distKm: winner.distKm,
             stage: stage.stage,
-            matchTimeSec: Math.round((Date.now() - this.activeMatches.get(rideId)?.startTime || Date.now()) / 1000),
+            matchTimeSec: Math.round((Date.now() - (this.activeMatches.get(rideId)?.startTime ?? Date.now())) / 1000),
           });
         }
       }, acceptDelay);
@@ -291,9 +292,7 @@ class MatchingEngine {
   // Continue matching from last stage after driver cancellation
   async resumeMatching(ride, fromStage) {
     logger.info('MATCHING', `Resuming matching for ride ${ride.rideId} from stage ${fromStage}`);
-    // Modify stages to start from the specified stage
-    const result = await this.startMatching(ride);
-    return result;
+    return this.startMatching(ride, fromStage);
   }
 
   getActiveMatches() {

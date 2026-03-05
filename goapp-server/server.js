@@ -47,7 +47,14 @@ function startAPIServer(port) {
         });
       }
 
-      const json = body ? JSON.parse(body) : {};
+      let json;
+      try {
+        json = body ? JSON.parse(body) : {};
+      } catch {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: 'Invalid JSON body' }));
+        return;
+      }
       const response = await handleRoute(method, path, json, url.searchParams);
       res.writeHead(response.status || 200);
       res.end(JSON.stringify(response.data, null, 2));
