@@ -460,6 +460,54 @@ class DemandLogService {
   // STATS
   // ═══════════════════════════════════════════════════════
 
+  // ─── Daily summary (today's totals aggregated from time buckets) ──────────
+  getDailySummary() {
+    const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    const todayBuckets = [];
+    this.timeBuckets.forEach(b => {
+      if (b.startTime && b.startTime.slice(0, 10) === today) todayBuckets.push(b);
+    });
+
+    const totalRequests   = todayBuckets.reduce((s, b) => s + b.totalRequests, 0);
+    const poolMatches     = todayBuckets.reduce((s, b) => s + b.poolMatches, 0);
+    const newPools        = todayBuckets.reduce((s, b) => s + b.newPools, 0);
+    const noMatches       = todayBuckets.reduce((s, b) => s + b.noMatches, 0);
+    const totalSavings    = Math.round(todayBuckets.reduce((s, b) => s + (b.totalSavingsInr || 0), 0) * 100) / 100;
+    const poolCompleted   = todayBuckets.reduce((s, b) => s + (b.poolCompleted || 0), 0);
+    const poolExpired     = todayBuckets.reduce((s, b) => s + (b.poolExpired || 0), 0);
+    const peakBuckets     = todayBuckets.filter(b => b.peakHour);
+    const peakRequests    = peakBuckets.reduce((s, b) => s + b.totalRequests, 0);
+
+    // Busiest area today
+    const areaArr = Array.from(this.areaDemand.values());
+    const busiest = areaArr.sort((a, b) => b.totalRequestsToday - a.totalRequestsToday)[0] || null;
+
+    const failAnalysis = this.getNoMatchAnalysis();
+    const topFailReason = failAnalysis.topReasons && failAnalysis.topReasons[0]
+      ? failAnalysis.topReasons[0].reason : null;
+
+    return {
+      summaryDate:         today,
+      totalRequests,
+      poolMatches,
+      newPoolsCreated:     newPools,
+      noMatches,
+      poolsCompleted:      poolCompleted,
+      poolsExpired:        poolExpired,
+      poolMatchRatePct:    totalRequests > 0 ? Math.round((poolMatches / totalRequests) * 10000) / 100 : 0,
+      noMatchRatePct:      totalRequests > 0 ? Math.round((noMatches / totalRequests) * 10000) / 100 : 0,
+      peakHourRequests:    peakRequests,
+      peakHourPct:         totalRequests > 0 ? Math.round((peakRequests / totalRequests) * 10000) / 100 : 0,
+      busiestAreaKey:      busiest ? busiest.areaKey : null,
+      busiestAreaRequests: busiest ? busiest.totalRequestsToday : 0,
+      totalSavingsInr:     totalSavings,
+      totalMatchFailures:  failAnalysis.totalFailures || 0,
+      topFailReason,
+      bucketCount:         todayBuckets.length,
+      computedAt:          new Date().toISOString(),
+    };
+  }
+
   getStats() {
     const areas = Array.from(this.areaDemand.values());
     const levelCounts = { LOW: 0, MEDIUM: 0, HIGH: 0, SURGE: 0 };

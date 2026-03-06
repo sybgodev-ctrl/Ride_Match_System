@@ -146,6 +146,8 @@ class NotificationService {
       body: 'Your trip has begun. Have a safe journey!',
       data: { type: 'TRIP_STARTED', rideId },
     });
+    // Also send a silent/data-only push so the app can recover if killed during the trip
+    this.sendSilent(riderId, { type: 'TRIP_STARTED', rideId, silent: 'true' });
   }
 
   /** Trip completed — notify both rider and driver */
@@ -219,6 +221,46 @@ class NotificationService {
   }
 
   // ─── Stats ────────────────────────────────────────────────────────────────
+  // ─── Silent / Data-only push (no banner shown to user) ────────────────────
+  // Used for background app wakeup: iOS content-available, Android data-only.
+  // The app wakes silently, reads the data payload, and calls /restore.
+  async sendSilent(userId, data = {}) {
+    if (!this.initialized) {
+      logger.info('FCM', `[SKIP — not initialised] silent push to ${userId}`);
+      return { sent: false, reason: 'not_initialized' };
+    }
+
+    const device = this.deviceTokens.get(userId);
+    if (!device) {
+      logger.info('FCM', `[SKIP — no token] silent push to ${userId}`);
+      return { sent: false, reason: 'no_token' };
+    }
+
+    const stringData = Object.fromEntries(
+      Object.entries(data).map(([k, v]) => [k, String(v)])
+    );
+
+    // No "notification" block — data-only message wakes app silently
+    const message = {
+      token: device.token,
+      data: stringData,
+      android: { priority: 'high' },
+      apns: {
+        headers: { 'apns-push-type': 'background', 'apns-priority': '5' },
+        payload: { aps: { 'content-available': 1 } },
+      },
+    };
+
+    try {
+      const messageId = await admin.messaging().send(message);
+      logger.info('FCM', `✓ Silent push to ${userId} (${device.platform}) [${messageId}]`);
+      return { sent: true, messageId };
+    } catch (err) {
+      logger.warn('FCM', `Silent push failed for ${userId}: ${err.message}`);
+      return { sent: false, error: err.message };
+    }
+  }
+
   getStats() {
     return {
       initialized: this.initialized,

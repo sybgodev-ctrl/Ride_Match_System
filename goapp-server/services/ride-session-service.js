@@ -220,7 +220,7 @@ class RideSessionService {
   // ─── Query recovery logs (admin) ──────────────────────────────────────────
   getRecoveryLogs({ type = null, riderId = null, limit = 50 } = {}) {
     let logs = this.recoveryLog.slice();
-    if (type)    logs = logs.filter(l => l.type === riderId);
+    if (type)    logs = logs.filter(l => l.type === type);
     if (riderId) logs = logs.filter(l => l.riderId === riderId);
     return logs.slice(-Math.min(limit, 500)).reverse();
   }

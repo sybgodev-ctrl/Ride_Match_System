@@ -216,6 +216,8 @@ function startAPIServer(port) {
     console.log('  GET    /api/v1/admin/demand/no-match-analysis  Why pool matches fail + recommendations');
     console.log('  GET    /api/v1/admin/demand/timeline?hours=24');
     console.log('  POST   /api/v1/admin/demand/snapshot        Trigger manual area snapshot');
+    console.log('  GET    /api/v1/admin/demand/daily-summary   Today\'s aggregated demand summary');
+    console.log('  GET    /api/v1/admin/recovery-logs?type=restore&riderId=xxx&limit=50');
     console.log('  GET    /api/v1/admin/pool?status=OPEN');
     console.log('  POST   /api/v1/admin/pool/:poolId/dispatch          { driverId }');
     console.log('  PUT    /api/v1/admin/pool/:poolId/status            { status }');
@@ -456,7 +458,10 @@ async function handleRoute(method, path, body, params, headers = {}) {
       const now = new Date();
       const hour = now.getHours();
       const isPeakHour = (hour >= 7 && hour <= 10) || (hour >= 17 && hour <= 21);
-      const incentiveUpdates = incentiveService.onRideCompleted(ride.driverId, { fareInr, isPeakHour });
+      const areaKey = ride.pickupLat && ride.pickupLng
+        ? `${parseFloat(ride.pickupLat).toFixed(2)}_${parseFloat(ride.pickupLng).toFixed(2)}`
+        : null;
+      const incentiveUpdates = incentiveService.onRideCompleted(ride.driverId, { fareInr, isPeakHour, areaKey });
       if (incentiveUpdates.length > 0) result.incentiveProgress = incentiveUpdates;
     }
 
@@ -1233,6 +1238,24 @@ async function handleRoute(method, path, body, params, headers = {}) {
     return { data: result };
   }
 
+  // GET /api/v1/admin/recovery-logs?type=restore&riderId=xxx&limit=50
+  if (path === '/api/v1/admin/recovery-logs' && method === 'GET') {
+    const authErr = requireAdmin(headers);
+    if (authErr) return authErr;
+    const type    = params.get('type') || null;
+    const riderId = params.get('riderId') || null;
+    const limit   = Math.min(parseInt(params.get('limit') || '50', 10), 500);
+    return { data: { logs: rideSessionService.getRecoveryLogs({ type, riderId, limit }) } };
+  }
+
+  // GET /api/v1/admin/demand/daily-summary
+  if (path === '/api/v1/admin/demand/daily-summary' && method === 'GET') {
+    const authErr = requireAdmin(headers);
+    if (authErr) return authErr;
+    return { data: demandLogService.getDailySummary() };
+  }
+
+  logger.warn('API', `404 ${method} ${path}`);
   return { status: 404, data: { error: 'Not found', path, method } };
 }
 
