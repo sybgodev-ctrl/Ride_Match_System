@@ -6,6 +6,7 @@ const redis = require('./redis-mock');
 const locationService = require('./location-service');
 const { calculateCompositeScore, haversine } = require('../utils/formulas');
 const { logger, eventBus } = require('../utils/logger');
+const driverWalletService = require('./driver-wallet-service');
 
 class MatchingEngine {
   constructor() {
@@ -126,6 +127,9 @@ class MatchingEngine {
       if (driver.status !== 'online') return false;
       if (rideType && driver.vehicleType !== rideType) return false;
       if (excluded.has(loc.driverId)) return false;
+      // Enforce ₹300 minimum wallet balance gate
+      const walletEligible = driverWalletService.canReceiveRide(loc.driverId);
+      if (!walletEligible.eligible) return false;
       return true;
     });
 

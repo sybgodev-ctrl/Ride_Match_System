@@ -9,6 +9,8 @@ const pricingService = require('./pricing-service');
 const notificationService = require('./notification-service');
 const { haversine } = require('../utils/formulas');
 const { logger, eventBus } = require('../utils/logger');
+const driverWalletService = require('./driver-wallet-service');
+const rideSessionService  = require('./ride-session-service');
 
 const S = config.rideStatuses;
 
@@ -64,6 +66,9 @@ class RideService {
 
     // Index active ride in Redis for fast recovery lookup (4-hour TTL)
     if (riderId) redis.set(`active_ride:${riderId}`, rideId, 4 * 3600);
+
+    // Track session for app-crash recovery
+    rideSessionService.onRideCreated(riderId, rideId);
 
     // Store idempotency
     if (idempotencyKey) {
@@ -196,6 +201,15 @@ class RideService {
     logger.divider(`RIDE COMPLETED: ${rideId}`);
     logger.success('RIDE', `Fare: ₹${finalFare.finalFare} | Driver: ₹${finalFare.driverEarnings} | Platform: ₹${finalFare.platformCommission}`);
 
+    // Credit driver earnings and deduct platform commission
+    if (ride.driverId) {
+      const platformFee = Math.round(finalFare.platformCommission * 100) / 100;
+      const driverEarnings = Math.round(finalFare.driverEarnings * 100) / 100;
+      driverWalletService.deductCommission(ride.driverId, platformFee, rideId);
+      driverWalletService.creditEarnings(ride.driverId, driverEarnings, rideId);
+    }
+    rideSessionService.onRideEnded(ride.riderId);
+
     notificationService.notifyTripCompleted(ride.riderId, ride.driverId, {
       rideId,
       finalFare: finalFare.finalFare,
@@ -316,6 +330,7 @@ class RideService {
     ride.cancelledAt = now;
     ride.cancelledBy = cancelledBy;
     if (ride.riderId) redis.del(`active_ride:${ride.riderId}`);
+    rideSessionService.onRideEnded(ride.riderId);
 
     return {
       success: true,

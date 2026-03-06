@@ -228,7 +228,7 @@ class IncentiveService {
 
   // ─── Bulk progress update — called on ride complete ───────────────────────
   // Increments trip_count, streak, and peak_hour tasks for a driver
-  onRideCompleted(driverId, { fareInr = 0, isPeakHour = false, rating = 5 }) {
+  onRideCompleted(driverId, { fareInr = 0, isPeakHour = false, rating = 5, areaKey = null }) {
     const now = new Date();
     const results = [];
 
@@ -247,6 +247,7 @@ class IncentiveService {
       else if (task.type === 'streak') increment = 1;
       else if (task.type === 'peak_hour' && isPeakHour) increment = 1;
       else if (task.type === 'rating' && rating >= (task.rules.minRating || 4.0)) increment = 1;
+      else if (task.type === 'area_bonus' && areaKey && task.rules.targetArea === areaKey) increment = 1;
 
       if (increment > 0) {
         const updated = this.updateProgress(driverId, taskId, increment);
