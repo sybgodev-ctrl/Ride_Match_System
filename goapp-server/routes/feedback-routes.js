@@ -39,14 +39,14 @@ function registerFeedbackRoutes(router, ctx) {
 
   // ─── Get all feedback received by a driver ───
   router.register('GET', '/api/v1/drivers/:driverId/feedback', async ({ pathParams, params }) => {
-    const limit = params && params.limit ? parseInt(params.limit, 10) : 50;
+    const limit = parseInt(params.get('limit') || '50', 10);
     const result = feedbackService.getDriverFeedbacks(pathParams.driverId, limit);
     return { data: result };
   });
 
   // ─── Get all feedback received by a rider ───
   router.register('GET', '/api/v1/riders/:riderId/feedback', async ({ pathParams, params }) => {
-    const limit = params && params.limit ? parseInt(params.limit, 10) : 50;
+    const limit = parseInt(params.get('limit') || '50', 10);
     const result = feedbackService.getRiderFeedbacks(pathParams.riderId, limit);
     return { data: result };
   });

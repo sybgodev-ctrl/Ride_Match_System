@@ -1,10 +1,17 @@
 // GoApp Driver Location Service
-// Manages real-time driver positions in Redis GEO
+// Manages real-time driver positions in Redis GEO.
+//
+// DB_BACKEND=pg  → additionally writes to PostGIS driver_locations table
+//                  (persistence + history) and falls back to PostGIS spatial
+//                  search when Redis GEO returns no results.
 
-const redis = require('./redis-client');
+const redis  = require('./redis-client');
 const config = require('../config');
 const { predictLocation, detectSpoofing } = require('../utils/formulas');
 const { logger, eventBus } = require('../utils/logger');
+
+const USE_PG = config.db.backend === 'pg';
+const pgRepo = USE_PG ? require('../repositories/pg/pg-location-repository') : null;
 
 const GEO_KEY = 'drivers:locations';
 const driverMeta = new Map(); // driverId -> { speed, heading, prevLocation, jumpCount, ... }
@@ -68,6 +75,12 @@ class LocationService {
     // ─── Store in Redis GEO ───
     redis.geoadd(GEO_KEY, lng, lat, driverId);
 
+    // ─── Persist to PostGIS (async, non-blocking) ───
+    if (USE_PG) {
+      pgRepo.recordLocation(driverId, { lat, lng, speed, heading })
+        .catch(err => logger.warn('LOCATION', `PostGIS write failed (non-fatal): ${err.message}`));
+    }
+
     // ─── Update metadata ───
     driverMeta.set(driverId, {
       lat, lng, speed: speed || 0, heading: heading || 0,
@@ -109,35 +122,53 @@ class LocationService {
     return { ...meta, stale: false, expired: false, ageSec: Math.round(age) };
   }
 
-  // Find nearby drivers using GEORADIUS
-  findNearby(lat, lng, radiusKm, maxCount) {
+  // Find nearby drivers using GEORADIUS (Redis primary, PostGIS fallback)
+  async findNearby(lat, lng, radiusKm, maxCount) {
     const results = redis.georadius(GEO_KEY, lng, lat, radiusKm, { count: maxCount * 3 });
 
-    // Filter out stale drivers
-    return results.filter(r => {
+    // Filter out stale drivers from Redis result
+    const fresh = results.filter(r => {
       const meta = driverMeta.get(r.member);
       if (!meta) return false;
-      const age = (Date.now() - meta.updatedAt) / 1000;
-      return age <= config.scoring.freshness.maxAgeSec;
+      return (Date.now() - meta.updatedAt) / 1000 <= config.scoring.freshness.maxAgeSec;
     }).map(r => {
       const meta = driverMeta.get(r.member);
       return {
-        driverId: r.member,
-        lat: r.lat,
-        lng: r.lng,
-        distance: r.distance,
-        speed: meta?.speed || 0,
-        heading: meta?.heading || 0,
+        driverId:   r.member,
+        lat:        r.lat,
+        lng:        r.lng,
+        distance:   r.distance,
+        speed:      meta?.speed   || 0,
+        heading:    meta?.heading || 0,
         lastUpdate: meta?.updatedAt,
-        ageSec: meta ? Math.round((Date.now() - meta.updatedAt) / 1000) : 999,
+        ageSec:     meta ? Math.round((Date.now() - meta.updatedAt) / 1000) : 999,
       };
     });
+
+    // PostGIS fallback when Redis returns nothing (e.g. Redis cleared/restart)
+    if (fresh.length === 0 && USE_PG) {
+      logger.info('LOCATION', `Redis GEO empty — falling back to PostGIS spatial query`);
+      const pgResults = await pgRepo.findNearbyDrivers(lat, lng, radiusKm, maxCount);
+      return pgResults.map(r => ({
+        driverId:   r.driverId,
+        lat:        r.lat,
+        lng:        r.lng,
+        distance:   r.distanceKm,
+        speed:      r.speed || 0,
+        heading:    r.heading || 0,
+        lastUpdate: r.lastUpdate,
+        ageSec:     Math.round((Date.now() - new Date(r.lastUpdate).getTime()) / 1000),
+      }));
+    }
+
+    return fresh;
   }
 
   // Remove driver from location tracking (went offline)
   removeDriver(driverId) {
     redis.georemove(GEO_KEY, driverId);
     driverMeta.delete(driverId);
+    if (USE_PG) pgRepo.removeDriverLocation(driverId).catch(() => {});
     logger.info('LOCATION', `Driver ${driverId} removed from tracking`);
   }
 
@@ -157,11 +188,16 @@ class LocationService {
     return all;
   }
 
-  getStats() {
-    return {
-      trackedDrivers: driverMeta.size,
+  async getStats() {
+    const base = {
+      trackedDrivers:  driverMeta.size,
       redisGeoMembers: redis.geoSets?.get(GEO_KEY)?.size || 0,
     };
+    if (USE_PG) {
+      const pgStats = await pgRepo.getStats().catch(() => ({}));
+      return { ...base, ...pgStats };
+    }
+    return base;
   }
 }
 

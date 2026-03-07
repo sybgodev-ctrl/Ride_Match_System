@@ -1,5 +1,8 @@
 // GoApp Configuration - All system constants from Architecture V2
 
+const NODE_ENV = process.env.NODE_ENV || 'development';
+const IS_DEVELOPMENT = NODE_ENV === 'development';
+
 module.exports = {
   server: {
     port:   parseInt(process.env.PORT    || '3000', 10),
@@ -91,7 +94,7 @@ module.exports = {
 
   admin: {
     // Override with GOAPP_ADMIN_TOKEN env var in production
-    token: process.env.GOAPP_ADMIN_TOKEN || 'goapp-admin-secret',
+    token: process.env.GOAPP_ADMIN_TOKEN || (IS_DEVELOPMENT ? 'goapp-admin-secret' : ''),
   },
 
   // ─── SMS / OTP Delivery ─────────────────────────────────────────────────
@@ -123,7 +126,7 @@ module.exports = {
 
   // ─── Security ────────────────────────────────────────────────────────────
   security: {
-    corsOrigin:   process.env.CORS_ORIGIN    || '*',
+    corsOrigin:   process.env.CORS_ORIGIN    || (IS_DEVELOPMENT ? '*' : ''),
     maxBodyBytes: parseInt(process.env.MAX_BODY_BYTES || String(256 * 1024), 10),
     sessionTtlMs: parseInt(process.env.SESSION_TTL_MS || String(24 * 3600 * 1000), 10),
   },
@@ -177,7 +180,7 @@ module.exports = {
   // DB_BACKEND=mock  → in-memory MockDb (default — zero setup for development)
   // DB_BACKEND=pg    → real PostgreSQL via pg.Pool (required for test/production)
   db: {
-    backend:  process.env.DB_BACKEND        || 'mock',
+    backend:  process.env.DB_BACKEND        || (IS_DEVELOPMENT ? 'mock' : 'pg'),
     host:     process.env.POSTGRES_HOST     || 'localhost',
     port:     parseInt(process.env.POSTGRES_PORT || '5432', 10),
     user:     process.env.POSTGRES_USER     || 'goapp',
@@ -203,8 +206,19 @@ module.exports = {
   // REDIS_BACKEND=mock  → in-memory RedisMock (default — zero setup for development)
   // REDIS_BACKEND=real  → real Redis client (required for test/production)
   redis: {
-    backend: process.env.REDIS_BACKEND || 'mock',
+    backend: process.env.REDIS_BACKEND || (IS_DEVELOPMENT ? 'mock' : 'real'),
     host:    process.env.REDIS_HOST    || 'localhost',
     port:    parseInt(process.env.REDIS_PORT || '6379', 10),
+  },
+
+  // ─── Kafka ─────────────────────────────────────────────────────────────────
+  // KAFKA_BACKEND=mock  → in-memory EventEmitter bus (default — zero setup)
+  // KAFKA_BACKEND=real  → real Apache Kafka via kafkajs (requires npm install kafkajs)
+  kafka: {
+    backend:  process.env.KAFKA_BACKEND  || 'mock',
+    clientId: process.env.KAFKA_CLIENT_ID || 'goapp-server',
+    brokers: (process.env.KAFKA_BROKERS  || 'localhost:9092').split(',').map(b => b.trim()),
+    // Consumer group prefix for multi-instance deployments
+    groupPrefix: process.env.KAFKA_GROUP_PREFIX || 'goapp',
   },
 };

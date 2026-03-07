@@ -98,13 +98,13 @@ function requireAdmin(headers) {
 // ─── Session auth helper ──────────────────────────────────────────────────
 // Returns { session } on success, or { error: { status, data } } to return immediately.
 // All callers: if (auth.error) return auth.error;
-function requireAuth(headers) {
+async function requireAuth(headers) {
   const authHeader = headers['authorization'] || '';
   const sessionToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : headers['x-session-token'];
   if (!sessionToken) {
     return { error: { status: 401, data: { error: 'Authentication required. Provide Authorization: Bearer <token> header.' } } };
   }
-  const session = identityService.validateSession(sessionToken);
+  const session = await identityService.validateSession(sessionToken);
   if (!session) {
     return { error: { status: 401, data: { error: 'Invalid or expired session token.' } } };
   }
@@ -482,7 +482,7 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   }
 
   if (path === '/api/v1/rides/request' && method === 'POST') {
-    const authResult = requireAuth(headers);
+    const authResult = await requireAuth(headers);
     if (authResult.error) return authResult.error;
     const pickupLat = parseFloat(body.pickupLat);
     const pickupLng = parseFloat(body.pickupLng);
@@ -553,7 +553,7 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   }
 
   if (path.match(/^\/api\/v1\/rides\/(.+)\/cancel$/) && method === 'POST') {
-    const authResult = requireAuth(headers);
+    const authResult = await requireAuth(headers);
     if (authResult.error) return authResult.error;
     const rideId = path.match(/^\/api\/v1\/rides\/(.+)\/cancel$/)[1];
     if (!body.cancelledBy) return { status: 400, data: { error: 'cancelledBy required' } };
@@ -562,7 +562,7 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   }
 
   if (path.match(/^\/api\/v1\/rides\/(.+)\/arrived$/) && method === 'POST') {
-    const authResult = requireAuth(headers);
+    const authResult = await requireAuth(headers);
     if (authResult.error) return authResult.error;
     const rideId = path.match(/^\/api\/v1\/rides\/(.+)\/arrived$/)[1];
     const ride = rideService.driverArrived(rideId);
@@ -571,7 +571,7 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   }
 
   if (path.match(/^\/api\/v1\/rides\/(.+)\/start$/) && method === 'POST') {
-    const authResult = requireAuth(headers);
+    const authResult = await requireAuth(headers);
     if (authResult.error) return authResult.error;
     const rideId = path.match(/^\/api\/v1\/rides\/(.+)\/start$/)[1];
     const ride = rideService.startTrip(rideId);
@@ -580,7 +580,7 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   }
 
   if (path.match(/^\/api\/v1\/rides\/(.+)\/complete$/) && method === 'POST') {
-    const authResult = requireAuth(headers);
+    const authResult = await requireAuth(headers);
     if (authResult.error) return authResult.error;
     const rideId = path.match(/^\/api\/v1\/rides\/(.+)\/complete$/)[1];
     const result = rideService.completeTrip(rideId, body.distanceKm, body.durationMin);
@@ -850,7 +850,7 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   // GET /api/v1/wallet/:userId — get coin balance
   const walletBalanceMatch = path.match(/^\/api\/v1\/wallet\/(.+)\/balance$/);
   if (walletBalanceMatch && method === 'GET') {
-    const authResult = requireAuth(headers);
+    const authResult = await requireAuth(headers);
     if (authResult.error) return authResult.error;
     const userId = walletBalanceMatch[1];
     return { data: walletService.getBalance(userId) };
@@ -859,7 +859,7 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   // GET /api/v1/wallet/:userId/transactions — transaction history
   const walletTxnMatch = path.match(/^\/api\/v1\/wallet\/(.+)\/transactions$/);
   if (walletTxnMatch && method === 'GET') {
-    const authResult = requireAuth(headers);
+    const authResult = await requireAuth(headers);
     if (authResult.error) return authResult.error;
     const userId = walletTxnMatch[1];
     const limit = parseInt(params.get('limit') || '20', 10);
@@ -869,7 +869,7 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   // POST /api/v1/wallet/:userId/redeem — redeem coins for discount
   const walletRedeemMatch = path.match(/^\/api\/v1\/wallet\/(.+)\/redeem$/);
   if (walletRedeemMatch && method === 'POST') {
-    const authResult = requireAuth(headers);
+    const authResult = await requireAuth(headers);
     if (authResult.error) return authResult.error;
     const userId = walletRedeemMatch[1];
     const { fareInr, coinsToUse } = body;
@@ -901,7 +901,7 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
 
   // POST /api/v1/sos — trigger SOS
   if (path === '/api/v1/sos' && method === 'POST') {
-    const authResult = requireAuth(headers);
+    const authResult = await requireAuth(headers);
     if (authResult.error) return authResult.error;
     const result = sosService.triggerSos(body);
     return { status: result.success ? 200 : 400, data: result };
@@ -969,7 +969,7 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   // POST /api/v1/wallet/:userId/topup  { amount, method, referenceId? }
   const walletTopupMatch = path.match(/^\/api\/v1\/wallet\/(.+)\/topup$/);
   if (walletTopupMatch && method === 'POST') {
-    const authResult = requireAuth(headers);
+    const authResult = await requireAuth(headers);
     if (authResult.error) return authResult.error;
     const userId = walletTopupMatch[1];
     const { amount, method: payMethod = 'upi', referenceId } = body;
@@ -981,7 +981,7 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   // POST /api/v1/wallet/:userId/pay  { fareInr, rideId }
   const walletPayMatch = path.match(/^\/api\/v1\/wallet\/(.+)\/pay$/);
   if (walletPayMatch && method === 'POST') {
-    const authResult = requireAuth(headers);
+    const authResult = await requireAuth(headers);
     if (authResult.error) return authResult.error;
     const userId = walletPayMatch[1];
     const { fareInr, rideId } = body;
@@ -993,7 +993,7 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   // POST /api/v1/wallet/:userId/refund  { amount, rideId, reason? }
   const walletRefundMatch = path.match(/^\/api\/v1\/wallet\/(.+)\/refund$/);
   if (walletRefundMatch && method === 'POST') {
-    const authResult = requireAuth(headers);
+    const authResult = await requireAuth(headers);
     if (authResult.error) return authResult.error;
     const userId = walletRefundMatch[1];
     const { amount, rideId, reason } = body;
@@ -1068,7 +1068,7 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
 
   // POST /api/v1/pool/match  { riderId, pickupLat, pickupLng, destLat, destLng, fareInr, rideType? }
   if (path === '/api/v1/pool/match' && method === 'POST') {
-    const authResult = requireAuth(headers);
+    const authResult = await requireAuth(headers);
     if (authResult.error) return authResult.error;
     const { riderId, pickupLat, pickupLng, destLat, destLng, fareInr, rideType } = body;
     if (!riderId || !pickupLat || !pickupLng || !destLat || !destLng || !fareInr) {
@@ -1088,7 +1088,7 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
 
   // POST /api/v1/pool  { riderId, pickupLat, pickupLng, destLat, destLng, fareInr, rideType? }
   if (path === '/api/v1/pool' && method === 'POST') {
-    const authResult = requireAuth(headers);
+    const authResult = await requireAuth(headers);
     if (authResult.error) return authResult.error;
     const result = demandAggregationService.createPool(body);
     return { status: result.success ? 201 : 400, data: result };
@@ -1104,7 +1104,7 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   // POST /api/v1/pool/:poolId/join  { riderId, pickupLat, pickupLng }
   const poolJoinMatch = path.match(/^\/api\/v1\/pool\/(.+)\/join$/);
   if (poolJoinMatch && method === 'POST') {
-    const authResult = requireAuth(headers);
+    const authResult = await requireAuth(headers);
     if (authResult.error) return authResult.error;
     const result = demandAggregationService.joinPool(poolJoinMatch[1], body);
     return { status: result.success ? 200 : 400, data: result };
@@ -1113,7 +1113,7 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   // POST /api/v1/pool/:poolId/leave  { riderId }
   const poolLeaveMatch = path.match(/^\/api\/v1\/pool\/(.+)\/leave$/);
   if (poolLeaveMatch && method === 'POST') {
-    const authResult = requireAuth(headers);
+    const authResult = await requireAuth(headers);
     if (authResult.error) return authResult.error;
     const result = demandAggregationService.leavePool(poolLeaveMatch[1], body.riderId);
     return { status: result.success ? 200 : 400, data: result };
@@ -1179,7 +1179,7 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   // POST /api/v1/incentives/:taskId/enrol  { driverId }
   const incentiveEnrolMatch = path.match(/^\/api\/v1\/incentives\/(.+)\/enrol$/);
   if (incentiveEnrolMatch && method === 'POST') {
-    const authResult = requireAuth(headers);
+    const authResult = await requireAuth(headers);
     if (authResult.error) return authResult.error;
     const result = incentiveService.enrolDriver(body.driverId, incentiveEnrolMatch[1]);
     return { status: result.success ? 200 : 400, data: result };
@@ -1188,7 +1188,7 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   // POST /api/v1/incentives/:taskId/claim  { driverId }
   const incentiveClaimMatch = path.match(/^\/api\/v1\/incentives\/(.+)\/claim$/);
   if (incentiveClaimMatch && method === 'POST') {
-    const authResult = requireAuth(headers);
+    const authResult = await requireAuth(headers);
     if (authResult.error) return authResult.error;
     const { driverId } = body;
     if (!driverId) return { status: 400, data: { error: 'driverId required' } };
@@ -1469,7 +1469,7 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   // POST /api/v1/riders/:riderId/restore  — full recovery payload (requires auth)
   const restoreMatch = path.match(/^\/api\/v1\/riders\/(.+)\/restore$/);
   if (restoreMatch && method === 'POST') {
-    const authResult = requireAuth(headers);
+    const authResult = await requireAuth(headers);
     if (authResult.error) return authResult.error;
     const riderId = restoreMatch[1];
     const result = rideSessionService.restoreSession(riderId, {
@@ -1486,7 +1486,7 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   // POST /api/v1/riders/:riderId/heartbeat  — keepalive ping every 30s
   const heartbeatMatch = path.match(/^\/api\/v1\/riders\/(.+)\/heartbeat$/);
   if (heartbeatMatch && method === 'POST') {
-    const authResult = requireAuth(headers);
+    const authResult = await requireAuth(headers);
     if (authResult.error) return authResult.error;
     const riderId = heartbeatMatch[1];
     const rideId = body.rideId || null;

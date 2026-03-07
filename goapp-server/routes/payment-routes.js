@@ -25,11 +25,12 @@ function registerPaymentRoutes(router, ctx) {
   // Body: { userId, amountInr }
   // Returns: { orderId, amount (paise), currency, keyId }
   router.register('POST', '/api/v1/payments/rider/create-order', async ({ body, headers }) => {
-    const auth = requireAuth(headers);
+    const auth = await requireAuth(headers);
     if (auth.error) return auth.error;
 
     const { userId, amountInr } = body;
     if (!userId) return { status: 400, data: { error: 'userId is required' } };
+    if (auth.session.userId !== userId) return { status: 403, data: { error: 'Forbidden: userId must match authenticated user.' } };
     if (!amountInr || amountInr < 1) {
       return { status: 400, data: { error: 'amountInr must be ≥ 1' } };
     }
@@ -49,7 +50,7 @@ function registerPaymentRoutes(router, ctx) {
   // Body: { razorpayOrderId, razorpayPaymentId, razorpaySignature }
   // On success: credits rider's wallet cash balance, returns updated balance
   router.register('POST', '/api/v1/payments/rider/verify', async ({ body, headers }) => {
-    const auth = requireAuth(headers);
+    const auth = await requireAuth(headers);
     if (auth.error) return auth.error;
 
     const { razorpayOrderId, razorpayPaymentId, razorpaySignature } = body;
@@ -69,9 +70,12 @@ function registerPaymentRoutes(router, ctx) {
     if (!verification.success) {
       return { status: 400, data: verification };
     }
+    if (auth.session.userId !== verification.userId) {
+      return { status: 403, data: { error: 'Forbidden: cannot verify payment for another user.' } };
+    }
 
     // Credit rider wallet cash balance
-    const topup = walletSvc.topupWallet(
+    const topup = await walletSvc.topupWallet(
       verification.userId,
       verification.amountInr,
       'razorpay',
@@ -98,7 +102,7 @@ function registerPaymentRoutes(router, ctx) {
   // POST /api/v1/payments/driver/create-order
   // Body: { driverId, amountInr }
   router.register('POST', '/api/v1/payments/driver/create-order', async ({ body, headers }) => {
-    const auth = requireAuth(headers);
+    const auth = await requireAuth(headers);
     if (auth.error) return auth.error;
 
     const { driverId, amountInr } = body;
@@ -122,7 +126,7 @@ function registerPaymentRoutes(router, ctx) {
   // Body: { razorpayOrderId, razorpayPaymentId, razorpaySignature }
   // On success: credits driver wallet, returns updated balance + eligibility
   router.register('POST', '/api/v1/payments/driver/verify', async ({ body, headers }) => {
-    const auth = requireAuth(headers);
+    const auth = await requireAuth(headers);
     if (auth.error) return auth.error;
 
     const { razorpayOrderId, razorpayPaymentId, razorpaySignature } = body;
@@ -144,7 +148,7 @@ function registerPaymentRoutes(router, ctx) {
     }
 
     // Credit driver wallet
-    const recharge = driverWalletSvc.rechargeWallet(
+    const recharge = await driverWalletSvc.rechargeWallet(
       verification.userId,
       verification.amountInr,
       'razorpay',
@@ -174,7 +178,7 @@ function registerPaymentRoutes(router, ctx) {
 
   // GET /api/v1/payments/orders/:orderId
   router.register('GET', '/api/v1/payments/orders/:orderId', async ({ pathParams, headers }) => {
-    const auth = requireAuth(headers);
+    const auth = await requireAuth(headers);
     if (auth.error) return auth.error;
 
     const order = razorpay.getOrder(pathParams.orderId);

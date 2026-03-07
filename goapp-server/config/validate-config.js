@@ -4,17 +4,18 @@ function validateConfig({ strict = false } = {}) {
   const errors = [];
   const warnings = [];
   const nodeEnv = process.env.NODE_ENV || 'development';
+  const isDevelopment = nodeEnv === 'development';
 
-  if (!process.env.GOAPP_ADMIN_TOKEN || config.admin.token === 'goapp-admin-secret') {
+  if (!config.admin.token || config.admin.token === 'goapp-admin-secret') {
     const msg = 'GOAPP_ADMIN_TOKEN is using default value.';
-    if (strict || nodeEnv === 'production') errors.push(msg); else warnings.push(msg);
+    if (!isDevelopment || strict) errors.push(msg); else warnings.push(msg);
   }
 
-  if ((nodeEnv === 'production' || strict) && (process.env.CORS_ORIGIN || '*') === '*') {
-    errors.push('CORS_ORIGIN must be explicitly set in strict/production mode.');
+  if ((!isDevelopment || strict) && (!config.security.corsOrigin || config.security.corsOrigin === '*')) {
+    errors.push('CORS_ORIGIN must be explicitly set outside development.');
   }
 
-  if ((nodeEnv === 'production' || strict) && config.sms.provider !== 'console') {
+  if ((!isDevelopment || strict) && config.sms.provider !== 'console') {
     if (config.sms.provider === 'twilio') {
       if (!config.sms.twilio.accountSid || !config.sms.twilio.authToken || !config.sms.twilio.fromNumber) {
         errors.push('Twilio SMS provider selected but credentials are incomplete.');
@@ -23,7 +24,7 @@ function validateConfig({ strict = false } = {}) {
   }
 
   // ─── Database validation ────────────────────────────────────────────────────
-  const needsRealServices = nodeEnv === 'test' || nodeEnv === 'production';
+  const needsRealServices = !isDevelopment;
 
   if (needsRealServices && config.db.backend !== 'pg') {
     errors.push(`DB_BACKEND must be 'pg' in ${nodeEnv} environment (got '${config.db.backend}').`);
@@ -35,8 +36,8 @@ function validateConfig({ strict = false } = {}) {
     if (config.db.pool.max < config.db.pool.min) {
       errors.push(`POSTGRES_POOL_MAX (${config.db.pool.max}) must be >= POSTGRES_POOL_MIN (${config.db.pool.min}).`);
     }
-    if (nodeEnv === 'production' && !config.db.ssl) {
-      warnings.push('POSTGRES_SSL is not enabled in production. Consider enabling SSL for RDS connections.');
+    if (!isDevelopment && !config.db.ssl) {
+      warnings.push('POSTGRES_SSL is not enabled in non-development environments. Consider enabling SSL for managed databases.');
     }
   }
 
