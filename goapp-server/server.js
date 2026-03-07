@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+// MUST be the first require() — loads .env.<NODE_ENV> before any module reads process.env
+require('./config/env-loader');
+
 const http = require('http');
 const crypto = require('crypto');
 const config = require('./config');
@@ -23,7 +26,7 @@ const ticketService = require('./services/ticket-service');
 const rideSessionService = require('./services/ride-session-service');
 const sosService = require('./services/sos-service');
 const smsService = require('./services/sms-service');
-const redis = require('./services/redis-mock');
+const redis = require('./services/redis-client');
 const mockDb = require('./services/mock-db');
 const zoneService = require('./services/zone-service');
 const notificationService = require('./services/notification-service');
@@ -43,20 +46,48 @@ const {
 // Max request body size: 256 KB (prevents memory exhaustion)
 const MAX_BODY_BYTES = 256 * 1024;
 
+// ─── Coordinate validator ─────────────────────────────────────────────────
+function validCoords(lat, lng) {
+  return Number.isFinite(lat) && Number.isFinite(lng)
+    && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180;
+}
+
+// ─── Safe integer param with clamp ───────────────────────────────────────
+function clampInt(value, min, max, fallback) {
+  const n = parseInt(value, 10);
+  return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : fallback;
+}
+
+// ─── Safe float param with clamp ─────────────────────────────────────────
+function clampFloat(value, min, max, fallback) {
+  const n = parseFloat(value);
+  return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : fallback;
+}
+
 // Test Data
 const { generateIdentityUsers } = require('./data/test-data');
 
 // ─── Admin auth helper ────────────────────────────────────────────────────
 function requireAdmin(headers) {
   const token = headers['x-admin-token'];
-  if (!token || token !== config.admin.token) {
+  const expected = config.admin.token;
+  let valid = false;
+  if (token) {
+    try {
+      const a = Buffer.from(token);
+      const b = Buffer.from(expected);
+      valid = a.length === b.length && crypto.timingSafeEqual(a, b);
+    } catch (_) { valid = false; }
+  }
+  if (!valid) {
     return { status: 401, data: { error: 'Admin authentication required. Provide X-Admin-Token header.' } };
   }
   return null;
 }
 
 // ─── Session auth helper ──────────────────────────────────────────────────
-// Returns session object or an error response to return immediately
+// Returns { session } on success, or { error: { status, data } } to return immediately.
+// All callers: if (auth.error) return auth.error;
 function requireAuth(headers) {
   const authHeader = headers['authorization'] || '';
   const sessionToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : headers['x-session-token'];
@@ -117,7 +148,8 @@ function startAPIServer(port) {
       const json = await parseJsonBody(req, MAX_BODY_BYTES);
       const response = await dispatchRoute(method, path, json, url.searchParams, headers);
       res.writeHead(response.status || 200);
-      res.end(JSON.stringify(response.data, null, 2));
+      const indent = process.env.NODE_ENV === 'production' ? 0 : 2;
+      res.end(JSON.stringify(response.data, null, indent));
       doneRequest();
     } catch (err) {
       doneRequest();
@@ -335,10 +367,10 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   if (path === '/api/v1/drivers/nearby' && method === 'GET') {
     const lat = parseFloat(params.get('lat'));
     const lng = parseFloat(params.get('lng'));
-    const radius = parseFloat(params.get('radius') || '5');
+    const radius = clampFloat(params.get('radius'), 0.1, 50, 5);
 
-    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
-      return { status: 400, data: { error: 'lat and lng required' } };
+    if (!validCoords(lat, lng)) {
+      return { status: 400, data: { error: 'lat and lng required and must be valid coordinates' } };
     }
 
     const nearby = locationService.findNearby(lat, lng, radius, 20);
@@ -352,50 +384,65 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   }
 
   if (path === '/api/v1/rides/request' && method === 'POST') {
+    const authResult = requireAuth(headers);
+    if (authResult.error) return authResult.error;
     const pickupLat = parseFloat(body.pickupLat);
     const pickupLng = parseFloat(body.pickupLng);
+    const destLat   = parseFloat(body.destLat);
+    const destLng   = parseFloat(body.destLng);
 
-    if (Number.isFinite(pickupLat) && Number.isFinite(pickupLng)) {
-      const zoneCheck = zoneService.checkPickup(pickupLat, pickupLng);
-      if (!zoneCheck.allowed) {
-        return { status: 403, data: { error: zoneCheck.message, reason: zoneCheck.reason } };
-      }
+    if (!validCoords(pickupLat, pickupLng)) {
+      return { status: 400, data: { error: 'pickupLat and pickupLng must be valid coordinates' } };
+    }
+
+    const zoneCheck = zoneService.checkPickup(pickupLat, pickupLng);
+    if (!zoneCheck.allowed) {
+      return { status: 403, data: { error: zoneCheck.message, reason: zoneCheck.reason } };
     }
 
     // Optional: preview coin redemption discount before creating ride
     let coinRedemptionPreview = null;
     if (body.useCoins && body.riderId) {
-      const estimates = await pricingService.getEstimates(pickupLat, pickupLng, parseFloat(body.destLat), parseFloat(body.destLng));
+      const estimates = await pricingService.getEstimates(pickupLat, pickupLng, destLat, destLng);
       const rideType = body.rideType || 'sedan';
       const estimatedFare = estimates.estimates[rideType]?.finalFare;
       if (estimatedFare) {
         const balance = walletService.getBalance(body.riderId);
+        const coinValue = parseFloat(process.env.COIN_INR_VALUE || '0.10');
+        const maxRedeemPct = parseFloat(process.env.MAX_REDEEM_PCT || '0.20');
+        // maxDiscountInr = min(rider's coins in INR, 20% of fare)
+        const maxDiscountInr = Math.min(
+          balance.coinBalance * coinValue,
+          estimatedFare * maxRedeemPct
+        );
         coinRedemptionPreview = {
-          coinsAvailable: balance.balance,
-          maxDiscountInr: Math.round(Math.min(balance.balance, Math.floor(estimatedFare * 0.20 / 0.10)) * 0.10 * 100) / 100,
+          coinsAvailable:  balance.coinBalance,
+          maxDiscountInr:  Math.round(maxDiscountInr * 100) / 100,
         };
       }
     }
 
-    // Record raw demand for area heatmap + time-series
-    if (Number.isFinite(pickupLat) && Number.isFinite(pickupLng)) {
-      demandLogService.recordDemand(pickupLat, pickupLng, 'ride_requested');
-      demandLogService.recordTimeslot('ride_requested');
-      demandLogService.logScenario('ride_requested', {
-        riderId:    body.riderId,
-        pickupLat,
-        pickupLng,
-        destLat:    parseFloat(body.destLat),
-        destLng:    parseFloat(body.destLng),
-        rideType:   body.rideType || 'sedan',
-        useCoins:   !!body.useCoins,
-        usedPool:   !!body.poolId,
-        outcome:    'requested',
-      });
-    }
+    // Record raw demand for area heatmap + time-series (fire-and-forget)
+    demandLogService.recordDemand(pickupLat, pickupLng, 'ride_requested');
+    demandLogService.recordTimeslot('ride_requested');
+    demandLogService.logScenario('ride_requested', {
+      riderId:    body.riderId,
+      pickupLat,
+      pickupLng,
+      destLat,
+      destLng,
+      rideType:   body.rideType || 'sedan',
+      useCoins:   !!body.useCoins,
+      usedPool:   !!body.poolId,
+      outcome:    'requested',
+    });
 
     const result = await rideService.createRide({
       ...body,
+      pickupLat,
+      pickupLng,
+      destLat,
+      destLng,
       idempotencyKey: body.idempotencyKey || crypto.randomUUID(),
     });
 
@@ -408,27 +455,38 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   }
 
   if (path.match(/^\/api\/v1\/rides\/(.+)\/cancel$/) && method === 'POST') {
-    const rideId = path.split('/')[4];
+    const authResult = requireAuth(headers);
+    if (authResult.error) return authResult.error;
+    const rideId = path.match(/^\/api\/v1\/rides\/(.+)\/cancel$/)[1];
+    if (!body.cancelledBy) return { status: 400, data: { error: 'cancelledBy required' } };
     const result = rideService.cancelRide(rideId, body.cancelledBy, body.userId);
     return { data: result };
   }
 
   if (path.match(/^\/api\/v1\/rides\/(.+)\/arrived$/) && method === 'POST') {
-    const rideId = path.split('/')[4];
+    const authResult = requireAuth(headers);
+    if (authResult.error) return authResult.error;
+    const rideId = path.match(/^\/api\/v1\/rides\/(.+)\/arrived$/)[1];
     const ride = rideService.driverArrived(rideId);
-    return { data: ride ? { status: ride.status, rideId } : { error: 'Invalid state' } };
+    if (!ride) return { status: 422, data: { error: 'Invalid state transition' } };
+    return { data: { status: ride.status, rideId } };
   }
 
   if (path.match(/^\/api\/v1\/rides\/(.+)\/start$/) && method === 'POST') {
-    const rideId = path.split('/')[4];
+    const authResult = requireAuth(headers);
+    if (authResult.error) return authResult.error;
+    const rideId = path.match(/^\/api\/v1\/rides\/(.+)\/start$/)[1];
     const ride = rideService.startTrip(rideId);
-    return { data: ride ? { status: ride.status, rideId } : { error: 'Invalid state' } };
+    if (!ride) return { status: 422, data: { error: 'Invalid state transition' } };
+    return { data: { status: ride.status, rideId } };
   }
 
   if (path.match(/^\/api\/v1\/rides\/(.+)\/complete$/) && method === 'POST') {
-    const rideId = path.split('/')[4];
+    const authResult = requireAuth(headers);
+    if (authResult.error) return authResult.error;
+    const rideId = path.match(/^\/api\/v1\/rides\/(.+)\/complete$/)[1];
     const result = rideService.completeTrip(rideId, body.distanceKm, body.durationMin);
-    if (!result) return { data: { error: 'Invalid state' } };
+    if (!result) return { status: 422, data: { error: 'Invalid state transition' } };
 
     // Optional coin redemption (deduct coins from rider's balance for discount)
     let coinRedemption = null;
@@ -497,7 +555,12 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   }
 
   if (path === '/api/v1/fare/estimate' && method === 'POST') {
-    const estimates = await pricingService.getEstimates(body.pickupLat, body.pickupLng, body.destLat, body.destLng);
+    const pickupLat = parseFloat(body.pickupLat);
+    const pickupLng = parseFloat(body.pickupLng);
+    if (!validCoords(pickupLat, pickupLng)) {
+      return { status: 400, data: { error: 'pickupLat and pickupLng must be valid coordinates' } };
+    }
+    const estimates = await pricingService.getEstimates(pickupLat, pickupLng, body.destLat, body.destLng);
     return { data: estimates };
   }
 
@@ -546,7 +609,7 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
         to: { lat: lat2, lng: lng2 },
         distanceKm: Math.round(dist * 100) / 100,
         bearingDeg: Math.round(bear * 10) / 10,
-        etaMin: Math.round((dist * 1.3 / config.scoring.avgCitySpeedKmh) * 60 * 10) / 10,
+        etaMin: Math.round((dist * 1.3 / (config.scoring.avgCitySpeedKmh || 25)) * 60 * 10) / 10,
       },
     };
   }
@@ -689,6 +752,8 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   // GET /api/v1/wallet/:userId — get coin balance
   const walletBalanceMatch = path.match(/^\/api\/v1\/wallet\/(.+)\/balance$/);
   if (walletBalanceMatch && method === 'GET') {
+    const authResult = requireAuth(headers);
+    if (authResult.error) return authResult.error;
     const userId = walletBalanceMatch[1];
     return { data: walletService.getBalance(userId) };
   }
@@ -696,6 +761,8 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   // GET /api/v1/wallet/:userId/transactions — transaction history
   const walletTxnMatch = path.match(/^\/api\/v1\/wallet\/(.+)\/transactions$/);
   if (walletTxnMatch && method === 'GET') {
+    const authResult = requireAuth(headers);
+    if (authResult.error) return authResult.error;
     const userId = walletTxnMatch[1];
     const limit = parseInt(params.get('limit') || '20', 10);
     return { data: walletService.getTransactions(userId, Math.min(limit, 100)) };
@@ -704,6 +771,8 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   // POST /api/v1/wallet/:userId/redeem — redeem coins for discount
   const walletRedeemMatch = path.match(/^\/api\/v1\/wallet\/(.+)\/redeem$/);
   if (walletRedeemMatch && method === 'POST') {
+    const authResult = requireAuth(headers);
+    if (authResult.error) return authResult.error;
     const userId = walletRedeemMatch[1];
     const { fareInr, coinsToUse } = body;
     if (!fareInr || fareInr <= 0) return { status: 400, data: { error: 'fareInr required' } };
@@ -734,6 +803,8 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
 
   // POST /api/v1/sos — trigger SOS
   if (path === '/api/v1/sos' && method === 'POST') {
+    const authResult = requireAuth(headers);
+    if (authResult.error) return authResult.error;
     const result = sosService.triggerSos(body);
     return { status: result.success ? 200 : 400, data: result };
   }
@@ -800,6 +871,8 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   // POST /api/v1/wallet/:userId/topup  { amount, method, referenceId? }
   const walletTopupMatch = path.match(/^\/api\/v1\/wallet\/(.+)\/topup$/);
   if (walletTopupMatch && method === 'POST') {
+    const authResult = requireAuth(headers);
+    if (authResult.error) return authResult.error;
     const userId = walletTopupMatch[1];
     const { amount, method: payMethod = 'upi', referenceId } = body;
     if (!amount || amount <= 0) return { status: 400, data: { error: 'amount required and must be > 0' } };
@@ -810,6 +883,8 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   // POST /api/v1/wallet/:userId/pay  { fareInr, rideId }
   const walletPayMatch = path.match(/^\/api\/v1\/wallet\/(.+)\/pay$/);
   if (walletPayMatch && method === 'POST') {
+    const authResult = requireAuth(headers);
+    if (authResult.error) return authResult.error;
     const userId = walletPayMatch[1];
     const { fareInr, rideId } = body;
     if (!fareInr || fareInr <= 0) return { status: 400, data: { error: 'fareInr required' } };
@@ -820,6 +895,8 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   // POST /api/v1/wallet/:userId/refund  { amount, rideId, reason? }
   const walletRefundMatch = path.match(/^\/api\/v1\/wallet\/(.+)\/refund$/);
   if (walletRefundMatch && method === 'POST') {
+    const authResult = requireAuth(headers);
+    if (authResult.error) return authResult.error;
     const userId = walletRefundMatch[1];
     const { amount, rideId, reason } = body;
     if (!amount || amount <= 0) return { status: 400, data: { error: 'amount required' } };
@@ -893,6 +970,8 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
 
   // POST /api/v1/pool/match  { riderId, pickupLat, pickupLng, destLat, destLng, fareInr, rideType? }
   if (path === '/api/v1/pool/match' && method === 'POST') {
+    const authResult = requireAuth(headers);
+    if (authResult.error) return authResult.error;
     const { riderId, pickupLat, pickupLng, destLat, destLng, fareInr, rideType } = body;
     if (!riderId || !pickupLat || !pickupLng || !destLat || !destLng || !fareInr) {
       return { status: 400, data: { error: 'riderId, pickupLat, pickupLng, destLat, destLng, fareInr required' } };
@@ -911,6 +990,8 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
 
   // POST /api/v1/pool  { riderId, pickupLat, pickupLng, destLat, destLng, fareInr, rideType? }
   if (path === '/api/v1/pool' && method === 'POST') {
+    const authResult = requireAuth(headers);
+    if (authResult.error) return authResult.error;
     const result = demandAggregationService.createPool(body);
     return { status: result.success ? 201 : 400, data: result };
   }
@@ -925,6 +1006,8 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   // POST /api/v1/pool/:poolId/join  { riderId, pickupLat, pickupLng }
   const poolJoinMatch = path.match(/^\/api\/v1\/pool\/(.+)\/join$/);
   if (poolJoinMatch && method === 'POST') {
+    const authResult = requireAuth(headers);
+    if (authResult.error) return authResult.error;
     const result = demandAggregationService.joinPool(poolJoinMatch[1], body);
     return { status: result.success ? 200 : 400, data: result };
   }
@@ -932,6 +1015,8 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   // POST /api/v1/pool/:poolId/leave  { riderId }
   const poolLeaveMatch = path.match(/^\/api\/v1\/pool\/(.+)\/leave$/);
   if (poolLeaveMatch && method === 'POST') {
+    const authResult = requireAuth(headers);
+    if (authResult.error) return authResult.error;
     const result = demandAggregationService.leavePool(poolLeaveMatch[1], body.riderId);
     return { status: result.success ? 200 : 400, data: result };
   }
@@ -996,6 +1081,8 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   // POST /api/v1/incentives/:taskId/enrol  { driverId }
   const incentiveEnrolMatch = path.match(/^\/api\/v1\/incentives\/(.+)\/enrol$/);
   if (incentiveEnrolMatch && method === 'POST') {
+    const authResult = requireAuth(headers);
+    if (authResult.error) return authResult.error;
     const result = incentiveService.enrolDriver(body.driverId, incentiveEnrolMatch[1]);
     return { status: result.success ? 200 : 400, data: result };
   }
@@ -1003,6 +1090,8 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   // POST /api/v1/incentives/:taskId/claim  { driverId }
   const incentiveClaimMatch = path.match(/^\/api\/v1\/incentives\/(.+)\/claim$/);
   if (incentiveClaimMatch && method === 'POST') {
+    const authResult = requireAuth(headers);
+    if (authResult.error) return authResult.error;
     const { driverId } = body;
     if (!driverId) return { status: 400, data: { error: 'driverId required' } };
     const result = incentiveService.claimReward(driverId, incentiveClaimMatch[1]);
@@ -1299,6 +1388,8 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
   // POST /api/v1/riders/:riderId/heartbeat  — keepalive ping every 30s
   const heartbeatMatch = path.match(/^\/api\/v1\/riders\/(.+)\/heartbeat$/);
   if (heartbeatMatch && method === 'POST') {
+    const authResult = requireAuth(headers);
+    if (authResult.error) return authResult.error;
     const riderId = heartbeatMatch[1];
     const rideId = body.rideId || null;
     const result = rideSessionService.heartbeat(riderId, rideId);
@@ -1322,13 +1413,15 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
     return { data: demandLogService.getDailySummary() };
   }
 
+  perfMonitor.recordNotFound();
   logger.warn('API', `404 ${method} ${path}`);
   return { status: 404, data: { error: 'Not found', path, method } };
 }
 
 function bootstrapTestData() {
+  const batchSize = Math.min(enterpriseConfig.performance.bootstrapBatchSize || 250, 1000);
   const seedResult = mockDb.seed({
-    driverCount: enterpriseConfig.performance.bootstrapBatchSize,
+    driverCount: batchSize,
     riderCount: 200,
   });
 
@@ -1373,10 +1466,12 @@ async function main() {
 
   bootstrapTestData();
 
+  let apiServer = null;
   if (!simOnly) {
-    startAPIServer(config.server.port);
+    apiServer = startAPIServer(config.server.port);
 
     const wsServer = new WebSocketServer();
+    wsServer.on('error', (err) => logger.error('WS', `WebSocket server error: ${err.message}`));
     wsServer.start(config.server.wsPort);
     wsServer.onLocationUpdate = (driverId, data) => {
       locationService.updateLocation(driverId, data);
@@ -1386,7 +1481,11 @@ async function main() {
   if (!apiOnly) {
     const Simulator = require('./simulation/simulator');
     const sim = new Simulator();
-    await sim.run();
+    try {
+      await sim.run();
+    } catch (err) {
+      logger.error('SIM', `Simulator crashed: ${err.message}. API server remains up.`);
+    }
   }
 
   if (!simOnly) {
@@ -1400,6 +1499,7 @@ async function main() {
 if (require.main === module) {
   main().catch(err => {
     console.error('Fatal error:', err);
+    try { demandLogService.stop(); } catch (_) {}
     process.exit(1);
   });
 }

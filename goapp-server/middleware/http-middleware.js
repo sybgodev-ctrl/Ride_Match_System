@@ -11,7 +11,7 @@ async function parseJsonBody(req, maxBodyBytes) {
   if (!['POST', 'PUT', 'DELETE'].includes(req.method)) return {};
 
   const body = await new Promise((resolve, reject) => {
-    let data = '';
+    const chunks = [];
     let size = 0;
     req.on('data', chunk => {
       size += chunk.length;
@@ -20,9 +20,10 @@ async function parseJsonBody(req, maxBodyBytes) {
         reject(Object.assign(new Error('Request body too large'), { statusCode: 413 }));
         return;
       }
-      data += chunk;
+      chunks.push(chunk);
     });
-    req.on('end', () => resolve(data));
+    // Buffer.concat avoids O(n²) string concatenation for large bodies
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
     req.on('error', reject);
   });
 

@@ -13,6 +13,9 @@ class PerfMonitor {
     this.matchingSuccess = 0;
     this.matchingFailed = 0;
     this.matchingTimes = [];     // sliding window of matching durations (ms)
+
+    // Error stats
+    this.notFoundTotal = 0;
   }
 
   // Call at the start of every request; returns a done() callback
@@ -26,6 +29,10 @@ class PerfMonitor {
         this.responseTimes.shift();
       }
     };
+  }
+
+  recordNotFound() {
+    this.notFoundTotal++;
   }
 
   recordMatch(success, durationMs) {
@@ -86,6 +93,7 @@ class PerfMonitor {
       throughput: {
         requestsTotal: this.requestsTotal,
         requestsPerMin,
+        notFoundTotal: this.notFoundTotal,
         sampledRequests: rt.length,
         avgResponseMs,
         p95ResponseMs,

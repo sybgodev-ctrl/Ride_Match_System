@@ -10,7 +10,7 @@ class RedisMock extends EventEmitter {
     super();
     this.store = new Map();         // key -> { value, expiresAt }
     this.geoSets = new Map();       // key -> Map<member, { lat, lng }>
-    this.setMaxListeners(100);
+    this.setMaxListeners(500);
 
     // TTL cleanup every second
     this._cleanupInterval = setInterval(() => this._cleanExpired(), 1000);
