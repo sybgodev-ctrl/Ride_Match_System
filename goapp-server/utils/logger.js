@@ -23,7 +23,7 @@ const colors = {
 };
 
 function timestamp() {
-  return new Date().toISOString().substr(11, 12);
+  return new Date().toISOString().slice(11, 23);
 }
 
 const logger = {
@@ -57,8 +57,10 @@ class EventBus extends EventEmitter {
   constructor() {
     super();
     this.events = [];
-    this.maxEvents = Number(process.env.EVENT_BUS_MAX_EVENTS || 5000);
-    this.setMaxListeners(100);
+    // Cap at 50k to prevent runaway memory from misconfigured env vars
+    this.maxEvents = Math.min(Number(process.env.EVENT_BUS_MAX_EVENTS || 5000), 50000);
+    // Allow high subscriber counts (pool/demand services attach many listeners)
+    this.setMaxListeners(500);
   }
 
   publish(eventName, data) {

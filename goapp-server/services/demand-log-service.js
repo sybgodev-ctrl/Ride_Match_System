@@ -443,7 +443,7 @@ class DemandLogService {
     tomorrow.setHours(0, 0, 0, 0);
     const msUntilMidnight = tomorrow - now;
 
-    setTimeout(() => {
+    this._dailyTimer = setTimeout(() => {
       this._dailyReset();
       this._scheduleDaily(); // reschedule for next day
     }, msUntilMidnight);
@@ -533,6 +533,18 @@ class DemandLogService {
       },
       scenarioLogs: this.getLogSummary(),
     };
+  }
+
+  // Call on server shutdown to prevent dangling intervals
+  stop() {
+    if (this._snapshotInterval) {
+      clearInterval(this._snapshotInterval);
+      this._snapshotInterval = null;
+    }
+    if (this._dailyTimer) {
+      clearTimeout(this._dailyTimer);
+      this._dailyTimer = null;
+    }
   }
 }
 

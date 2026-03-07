@@ -22,6 +22,9 @@ const COINS_PER_INR_EARN = parseFloat(process.env.COINS_PER_INR_EARN || '10');  
 const MIN_REDEEM_COINS   = parseInt(process.env.MIN_REDEEM_COINS    || '10', 10);
 const MAX_REDEEM_PCT     = parseFloat(process.env.MAX_REDEEM_PCT     || '0.20'); // max 20% of fare
 
+// Maximum transaction history kept per wallet (circular buffer cap)
+const MAX_WALLET_TRANSACTIONS = 100;
+
 class WalletService {
   constructor() {
     // userId -> { coinBalance, cashBalance, transactions[] }
@@ -39,6 +42,14 @@ class WalletService {
       });
     }
     return this.wallets.get(userId);
+  }
+
+  // ─── Record a transaction, keeping only the last MAX_WALLET_TRANSACTIONS ─
+  _recordTx(wallet, tx) {
+    wallet.transactions.push(tx);
+    if (wallet.transactions.length > MAX_WALLET_TRANSACTIONS) {
+      wallet.transactions.shift(); // drop oldest
+    }
   }
 
   getBalance(userId) {
@@ -73,7 +84,7 @@ class WalletService {
       cashBalanceAfter: wallet.cashBalance,
       createdAt: new Date().toISOString(),
     };
-    wallet.transactions.push(tx);
+    this._recordTx(wallet, tx);
 
     eventBus.publish('coins_earned', { userId, coins: earned, rideId, balance: wallet.coinBalance });
     logger.info('WALLET', `User ${userId} earned ${earned} coins (ride ${rideId}). Coin balance: ${wallet.coinBalance}`);
@@ -116,7 +127,7 @@ class WalletService {
       cashBalanceAfter: wallet.cashBalance,
       createdAt: new Date().toISOString(),
     };
-    wallet.transactions.push(tx);
+    this._recordTx(wallet, tx);
 
     eventBus.publish('coins_redeemed', { userId, coinsRedeemed: maxAllowed, discountInr, finalFare });
     logger.info('WALLET', `User ${userId} redeemed ${maxAllowed} coins → ₹${discountInr} off. Final fare: ₹${finalFare}`);
@@ -153,7 +164,7 @@ class WalletService {
       cashBalanceAfter: wallet.cashBalance,
       createdAt: new Date().toISOString(),
     };
-    wallet.transactions.push(tx);
+    this._recordTx(wallet, tx);
 
     eventBus.publish('wallet_topup', { userId, amount, method, cashBalance: wallet.cashBalance });
     logger.info('WALLET', `User ${userId} topped up ₹${amount} via ${method}. Cash balance: ₹${wallet.cashBalance}`);
@@ -194,7 +205,7 @@ class WalletService {
       cashBalanceAfter: wallet.cashBalance,
       createdAt: new Date().toISOString(),
     };
-    wallet.transactions.push(tx);
+    this._recordTx(wallet, tx);
 
     eventBus.publish('wallet_payment', { userId, fareInr, rideId, cashBalance: wallet.cashBalance });
     logger.info('WALLET', `User ${userId} paid ₹${fareInr} for ride ${rideId} via wallet. Cash balance: ₹${wallet.cashBalance}`);
@@ -224,7 +235,7 @@ class WalletService {
       cashBalanceAfter: wallet.cashBalance,
       createdAt: new Date().toISOString(),
     };
-    wallet.transactions.push(tx);
+    this._recordTx(wallet, tx);
 
     eventBus.publish('wallet_refund', { userId, amount, rideId, reason });
     logger.info('WALLET', `Refunded ₹${amount} to user ${userId} wallet (${reason}). Cash balance: ₹${wallet.cashBalance}`);
@@ -246,7 +257,7 @@ class WalletService {
       cashBalanceAfter: wallet.cashBalance,
       createdAt: new Date().toISOString(),
     };
-    wallet.transactions.push(tx);
+    this._recordTx(wallet, tx);
     logger.info('WALLET', `Admin adjusted ${coins} coins for ${userId} (${reason}). Coin balance: ${wallet.coinBalance}`);
     return { success: true, transaction: tx, coinBalance: wallet.coinBalance };
   }
@@ -265,7 +276,7 @@ class WalletService {
       cashBalanceAfter: wallet.cashBalance,
       createdAt: new Date().toISOString(),
     };
-    wallet.transactions.push(tx);
+    this._recordTx(wallet, tx);
     logger.info('WALLET', `Admin adjusted ₹${amount} cash for ${userId} (${reason}). Cash balance: ₹${wallet.cashBalance}`);
     return { success: true, transaction: tx, cashBalance: wallet.cashBalance };
   }

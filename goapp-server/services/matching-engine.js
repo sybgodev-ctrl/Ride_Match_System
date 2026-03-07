@@ -2,7 +2,7 @@
 // Multi-stage matching, composite scoring, distributed locks, timeouts
 
 const config = require('../config');
-const redis = require('./redis-mock');
+const redis = require('./redis-client');
 const locationService = require('./location-service');
 const { calculateCompositeScore, haversine } = require('../utils/formulas');
 const { logger, eventBus } = require('../utils/logger');
@@ -217,9 +217,18 @@ class MatchingEngine {
 
     // Simulate driver responses
     return new Promise((resolve) => {
+      let settled = false;  // guard: ensure promise resolves exactly once
+
+      const settle = (result) => {
+        if (settled) return;
+        settled = true;
+        resolve(result);
+      };
+
       const timeout = setTimeout(() => {
+        clearTimeout(acceptTimer);
         logger.warn('MATCHING', `  └─ Stage ${stage.stage}: Timeout (${stage.timeoutSec}s) - no driver accepted`);
-        resolve({ accepted: false, reason: 'TIMEOUT' });
+        settle({ accepted: false, reason: 'TIMEOUT' });
       }, stage.timeoutSec * 1000);
 
       // Simulate: random driver accepts within timeout
@@ -227,10 +236,12 @@ class MatchingEngine {
       const respondingDrivers = rankedDrivers.filter(() => Math.random() > 0.3);
 
       if (respondingDrivers.length === 0) {
-        return; // Let timeout handle it
+        // No drivers responded — let the timeout fire normally
+        var acceptTimer = null;
+        return;
       }
 
-      setTimeout(() => {
+      var acceptTimer = setTimeout(() => {
         clearTimeout(timeout);
 
         // First responding driver tries to claim
@@ -250,7 +261,7 @@ class MatchingEngine {
 
           logger.success('MATCHING', `  └─ MATCHED! Driver ${winner.driverName} (${winner.driverId}) | Score: ${winner.score} | ETA: ${winner.etaMin}min`);
 
-          resolve({
+          settle({
             accepted: true,
             success: true,
             driverId: winner.driverId,
@@ -263,6 +274,10 @@ class MatchingEngine {
             stage: stage.stage,
             matchTimeSec: Math.round((Date.now() - (this.activeMatches.get(rideId)?.startTime ?? Date.now())) / 1000),
           });
+        } else {
+          // Lock was taken by another process — treat as timeout for this stage
+          logger.warn('MATCHING', `  └─ Stage ${stage.stage}: Lock contention — treating as no-accept`);
+          settle({ accepted: false, reason: 'LOCK_CONTENTION' });
         }
       }, acceptDelay);
     });

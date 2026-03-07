@@ -3,7 +3,7 @@
 
 const crypto = require('crypto');
 const config = require('../config');
-const redis = require('./redis-mock');
+const redis = require('./redis-client');
 const matchingEngine = require('./matching-engine');
 const pricingService = require('./pricing-service');
 const notificationService = require('./notification-service');
@@ -26,15 +26,15 @@ class RideService {
   async createRide({ riderId, pickupLat, pickupLng, destLat, destLng, rideType, idempotencyKey }) {
     // ─── Idempotency Check ───
     if (idempotencyKey) {
-      const check = redis.checkIdempotency(idempotencyKey);
+      const check = await redis.checkIdempotency(idempotencyKey);
       if (check.isDuplicate) {
-        logger.warn('RIDE', `Duplicate request detected (idempotency: ${idempotencyKey.substr(0, 8)})`);
+        logger.warn('RIDE', `Duplicate request detected (idempotency: ${idempotencyKey.slice(0, 8)})`);
         return { ...check.existingResult, duplicate: true };
       }
     }
 
     // ─── Create Ride ───
-    const rideId = `RIDE-${crypto.randomUUID().substr(0, 8).toUpperCase()}`;
+    const rideId = `RIDE-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
     const now = Date.now();
 
     // Get fare estimates (async: uses Google Maps road distance when configured)

@@ -1,13 +1,27 @@
 // GoApp Driver Location Service
 // Manages real-time driver positions in Redis GEO
 
-const redis = require('./redis-mock');
+const redis = require('./redis-client');
 const config = require('../config');
 const { predictLocation, detectSpoofing } = require('../utils/formulas');
 const { logger, eventBus } = require('../utils/logger');
 
 const GEO_KEY = 'drivers:locations';
 const driverMeta = new Map(); // driverId -> { speed, heading, prevLocation, jumpCount, ... }
+
+// Evict stale entries every 5 minutes to prevent unbounded Map growth.
+// Entries older than maxAgeSec are considered gone and removed.
+const _evictTimer = setInterval(() => {
+  const maxAgeMs = (config.scoring?.freshness?.maxAgeSec ?? 300) * 1000;
+  const cutoff = Date.now() - maxAgeMs;
+  for (const [driverId, meta] of driverMeta) {
+    if (meta.updatedAt < cutoff) {
+      driverMeta.delete(driverId);
+      logger.info('LOCATION', `Evicted stale driver ${driverId} from location cache`);
+    }
+  }
+}, 5 * 60 * 1000);
+_evictTimer.unref();
 
 class LocationService {
   // Process incoming GPS update from driver
@@ -146,7 +160,7 @@ class LocationService {
   getStats() {
     return {
       trackedDrivers: driverMeta.size,
-      redisGeoMembers: redis.geoSets.get(GEO_KEY)?.size || 0,
+      redisGeoMembers: redis.geoSets?.get(GEO_KEY)?.size || 0,
     };
   }
 }
