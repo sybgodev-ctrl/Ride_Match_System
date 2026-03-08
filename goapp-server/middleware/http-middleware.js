@@ -1,11 +1,21 @@
+const config = require('../config');
+
 function applySecurityHeaders(req, res) {
-  const allowedOrigin = process.env.CORS_ORIGIN || '*';
-  res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
+  // Use the explicit CORS origin from config; if unset in production, send no
+  // CORS header (most restrictive) rather than falling back to '*'.
+  const allowedOrigin = config.security.corsOrigin;
+  if (allowedOrigin) {
+    res.setHeader('Access-Control-Allow-Origin', allowedOrigin);
+  }
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Session-Token, X-Admin-Token');
   res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition');
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Content-Type', 'application/json');
+  // Enforce HTTPS in production — tells browsers never to downgrade to HTTP.
+  if (process.env.NODE_ENV === 'production') {
+    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
 }
 
 async function parseJsonBody(req, maxBodyBytes) {
@@ -29,7 +39,15 @@ async function parseJsonBody(req, maxBodyBytes) {
   });
 
   if (!body) return {};
-  return JSON.parse(body);
+
+  // Throw a SyntaxError so the server's outer catch can return 400.
+  try {
+    return JSON.parse(body);
+  } catch (_) {
+    const err = new SyntaxError('Invalid JSON body');
+    err.statusCode = 400;
+    throw err;
+  }
 }
 
 // Reads raw body as a Buffer (used for webhook signature verification where we need the

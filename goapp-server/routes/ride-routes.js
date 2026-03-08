@@ -3,6 +3,7 @@ const crypto = require('crypto');
 function registerRideRoutes(router, ctx) {
   const { services, repositories } = ctx;
   const requireAuth = ctx.requireAuth;
+  const requireAdmin = ctx.requireAdmin;
 
   async function authenticate(headers) {
     const auth = await requireAuth(headers || {});
@@ -12,6 +13,11 @@ function registerRideRoutes(router, ctx) {
 
   function canAccessRide(sessionUserId, ride) {
     return ride && (ride.riderId === sessionUserId || ride.driverId === sessionUserId);
+  }
+
+  function isAdmin(headers = {}) {
+    if (!headers['x-admin-token']) return false;
+    return !requireAdmin(headers);
   }
 
   router.register('POST', '/api/v1/rides/request', async ({ body, headers }) => {
@@ -65,7 +71,16 @@ function registerRideRoutes(router, ctx) {
     return { data: result };
   });
 
-  router.register('GET', '/api/v1/rides', async () => ({ data: { rides: repositories.ride.getAllRides() } }));
+  router.register('GET', '/api/v1/rides', async ({ headers }) => {
+    const auth = await authenticate(headers);
+    if (auth.error) return auth.error;
+
+    const rides = await repositories.ride.getAllRides();
+    if (isAdmin(headers || {})) return { data: { rides } };
+
+    const ownRides = rides.filter(ride => canAccessRide(auth.session.userId, ride));
+    return { data: { rides: ownRides } };
+  });
 
   router.register('GET', '/api/v1/rides/:rideId', async ({ pathParams, headers }) => {
     const auth = await authenticate(headers);

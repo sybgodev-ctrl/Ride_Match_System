@@ -73,7 +73,8 @@ class LocationService {
     }
 
     // ─── Store in Redis GEO ───
-    redis.geoadd(GEO_KEY, lng, lat, driverId);
+    Promise.resolve(redis.geoadd(GEO_KEY, lng, lat, driverId))
+      .catch(err => logger.warn('LOCATION', `Redis GEOADD failed (non-fatal): ${err.message}`));
 
     // ─── Persist to PostGIS (async, non-blocking) ───
     if (USE_PG) {
@@ -124,7 +125,7 @@ class LocationService {
 
   // Find nearby drivers using GEORADIUS (Redis primary, PostGIS fallback)
   async findNearby(lat, lng, radiusKm, maxCount) {
-    const results = redis.georadius(GEO_KEY, lng, lat, radiusKm, { count: maxCount * 3 });
+    const results = await redis.georadius(GEO_KEY, lng, lat, radiusKm, { count: maxCount * 3 });
 
     // Filter out stale drivers from Redis result
     const fresh = results.filter(r => {
@@ -166,7 +167,7 @@ class LocationService {
 
   // Remove driver from location tracking (went offline)
   removeDriver(driverId) {
-    redis.georemove(GEO_KEY, driverId);
+    Promise.resolve(redis.georemove(GEO_KEY, driverId)).catch(() => {});
     driverMeta.delete(driverId);
     if (USE_PG) pgRepo.removeDriverLocation(driverId).catch(() => {});
     logger.info('LOCATION', `Driver ${driverId} removed from tracking`);

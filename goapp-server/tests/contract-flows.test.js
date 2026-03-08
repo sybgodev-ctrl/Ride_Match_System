@@ -83,6 +83,43 @@ test('contract: OTP request -> verify issues session token', async () => {
   assert.ok(verifyRes.json.sessionToken);
 });
 
+test('contract: rider auth API shape request-otp -> login', async () => {
+  const phone = '9876543210';
+  const countryCode = '+91';
+  const requestRes = await api('/api/v1/auth/request-otp', {
+    method: 'POST',
+    body: { phone, countryCode, channel: 'sms' },
+  });
+  assert.equal(requestRes.status, 200);
+  assert.equal(requestRes.json.success, true);
+  assert.ok(requestRes.json.data?.requestId);
+  assert.equal(typeof requestRes.json.data?.expiresInSec, 'number');
+
+  const combinedPhone = `${countryCode}${phone}`;
+  const pending = identityService.otpByRequestId.get(requestRes.json.data.requestId);
+  const otp = pending?.otpCode;
+  assert.ok(otp);
+
+  const loginRes = await api('/api/v1/auth/login', {
+    method: 'POST',
+    body: {
+      phone,
+      countryCode,
+      otp,
+      deviceId: 'android-2f3a9c',
+      platform: 'android',
+      fcmToken: 'fcm_token_optional',
+    },
+  });
+
+  assert.equal(loginRes.status, 200);
+  assert.equal(loginRes.json.success, true);
+  assert.equal(loginRes.json.message, 'Login successful');
+  assert.ok(loginRes.json.data?.accessToken);
+  assert.ok(loginRes.json.data?.refreshToken);
+  assert.equal(loginRes.json.data?.user?.phone, combinedPhone.replace(/^\+/, ''));
+});
+
 test('contract: ride request -> matched/driver arriving', async () => {
   const { verifyRes } = await createSessionToken('+919222222222');
   const sessionToken = verifyRes.json.sessionToken;

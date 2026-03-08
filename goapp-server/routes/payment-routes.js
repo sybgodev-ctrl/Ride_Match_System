@@ -107,6 +107,9 @@ function registerPaymentRoutes(router, ctx) {
 
     const { driverId, amountInr } = body;
     if (!driverId) return { status: 400, data: { error: 'driverId is required' } };
+    if (auth.session.userId !== driverId) {
+      return { status: 403, data: { error: 'Forbidden: driverId must match authenticated user.' } };
+    }
     if (!amountInr || amountInr < 1) {
       return { status: 400, data: { error: 'amountInr must be ≥ 1' } };
     }
@@ -146,6 +149,9 @@ function registerPaymentRoutes(router, ctx) {
     if (!verification.success) {
       return { status: 400, data: verification };
     }
+    if (auth.session.userId !== verification.userId) {
+      return { status: 403, data: { error: 'Forbidden: cannot verify payment for another user.' } };
+    }
 
     // Credit driver wallet
     const recharge = await driverWalletSvc.rechargeWallet(
@@ -184,6 +190,9 @@ function registerPaymentRoutes(router, ctx) {
     const order = razorpay.getOrder(pathParams.orderId);
     if (!order) {
       return { status: 404, data: { error: 'Order not found' } };
+    }
+    if (auth.session.userId !== order.userId) {
+      return { status: 403, data: { error: 'Forbidden: cannot access another user order.' } };
     }
     return { data: order };
   });

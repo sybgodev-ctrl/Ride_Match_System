@@ -41,6 +41,16 @@ class PgIdentityRepository {
 
   // ─── OTP Requests ─────────────────────────────────────────────────────────
 
+  async expirePendingOtpsByPhone(phoneNumber) {
+    await db.query(
+      `UPDATE otp_requests
+       SET status = 'expired'
+       WHERE phone_number = $1
+         AND status = 'pending'`,
+      [phoneNumber]
+    );
+  }
+
   async createOtpRequest({ requestId, phoneNumber, otpCode, otpType, channel, expiresAt }) {
     await db.query(
       `INSERT INTO otp_requests
@@ -90,6 +100,48 @@ class PgIdentityRepository {
       [requestId, newStatus || null]
     );
     return rows[0];
+  }
+
+  // ─── User Profiles ────────────────────────────────────────────────────────
+
+  async upsertUserProfile({ userId, name, gender, emergencyContact }) {
+    await db.query(
+      `INSERT INTO user_profiles (user_id, display_name, gender, emergency_contact)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (user_id) DO UPDATE
+         SET display_name       = EXCLUDED.display_name,
+             gender             = EXCLUDED.gender,
+             emergency_contact  = EXCLUDED.emergency_contact,
+             updated_at         = NOW()`,
+      [userId, name, gender, emergencyContact || null]
+    );
+  }
+
+  async getUserProfile(userId) {
+    const { rows } = await db.query(
+      `SELECT display_name AS name, gender, emergency_contact
+       FROM user_profiles WHERE user_id = $1`,
+      [userId]
+    );
+    return rows[0] || null;
+  }
+
+  async updateUserEmail(userId, email) {
+    await db.query(
+      `UPDATE users SET email = $2, updated_at = NOW() WHERE id = $1`,
+      [userId, email]
+    );
+  }
+
+  async isProfileComplete(userId) {
+    const { rows } = await db.query(
+      `SELECT 1 FROM user_profiles
+       WHERE user_id = $1
+         AND display_name IS NOT NULL AND display_name <> ''
+         AND gender       IS NOT NULL AND gender       <> ''`,
+      [userId]
+    );
+    return rows.length > 0;
   }
 
   // ─── Users ────────────────────────────────────────────────────────────────

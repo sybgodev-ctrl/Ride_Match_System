@@ -11,6 +11,11 @@ function validateConfig({ strict = false } = {}) {
     if (!isDevelopment || strict) errors.push(msg); else warnings.push(msg);
   }
 
+  if (!config.otp?.secret || config.otp.secret === 'dev-otp-secret-change-me-in-prod') {
+    const msg = 'OTP_SECRET is using the default dev value. Set a strong random secret for production.';
+    if (!isDevelopment || strict) errors.push(msg); else warnings.push(msg);
+  }
+
   if ((!isDevelopment || strict) && (!config.security.corsOrigin || config.security.corsOrigin === '*')) {
     errors.push('CORS_ORIGIN must be explicitly set outside development.');
   }

@@ -34,6 +34,7 @@ const notificationService = require('./services/notification-service');
 const WebSocketServer = require('./websocket/ws-gateway');
 const { haversine, bearing } = require('./utils/formulas');
 const googleMapsService = require('./services/google-maps-service');
+const db = require('./services/db');
 const { applySecurityHeaders, parseJsonBody, readRawBody } = require('./middleware/http-middleware');
 const { parseMultipart } = require('./middleware/multipart-parser');
 const DocumentStorageService = require('./services/document-storage-service');
@@ -81,6 +82,11 @@ const { generateIdentityUsers } = require('./data/test-data');
 function requireAdmin(headers) {
   const token = headers['x-admin-token'];
   const expected = config.admin.token;
+  // Deny immediately if the server has no admin token configured — prevents
+  // empty-string timingSafeEqual bypass where both buffers have length 0.
+  if (!expected) {
+    return { status: 401, data: { error: 'Admin access is not configured on this server.' } };
+  }
   let valid = false;
   if (token) {
     try {
@@ -149,6 +155,10 @@ function startAPIServer(port) {
     const path = url.pathname;
     const method = req.method;
     const headers = req.headers;
+    // Prefer X-Forwarded-For (set by load balancers/proxies); fall back to socket address.
+    const clientIp = (req.headers['x-forwarded-for'] || '').split(',')[0].trim()
+      || req.socket?.remoteAddress
+      || '';
 
     applySecurityHeaders(req, res);
 
@@ -222,7 +232,7 @@ function startAPIServer(port) {
         body = await parseJsonBody(req, MAX_BODY_BYTES);
       }
 
-      const response = await dispatchRoute(method, path, body, url.searchParams, headers, files);
+      const response = await dispatchRoute(method, path, body, url.searchParams, headers, files, clientIp);
 
       // Binary file response (e.g. driver document file download)
       if (response.raw) {
@@ -471,7 +481,7 @@ async function handleLegacyRoute(method, path, body, params, headers = {}) {
       return { status: 400, data: { error: 'lat and lng required and must be valid coordinates' } };
     }
 
-    const nearby = locationService.findNearby(lat, lng, radius, 20);
+    const nearby = await locationService.findNearby(lat, lng, radius, 20);
     return { data: { count: nearby.length, drivers: nearby } };
   }
 
@@ -1543,12 +1553,47 @@ function bootstrapTestData() {
   });
 }
 
+async function assertPgSchemaReady() {
+  if (config.db.backend !== 'pg') return;
+
+  const requiredTables = [
+    'users',
+    'otp_requests',
+    'user_sessions',
+    'drivers',
+    'riders',
+    'rides',
+    'driver_locations',
+    'driver_wallets',
+    'rider_wallets',
+  ];
+
+  const { rows } = await db.query(
+    `SELECT table_name
+     FROM information_schema.tables
+     WHERE table_schema = 'public'
+       AND table_name = ANY($1::text[])`,
+    [requiredTables]
+  );
+
+  const present = new Set(rows.map(r => r.table_name));
+  const missing = requiredTables.filter(t => !present.has(t));
+  if (missing.length > 0) {
+    throw new Error(
+      `Database schema is incomplete. Missing tables: ${missing.join(', ')}. ` +
+      'Run enterprise-setup/sql/run-migrations.sh (or apply sql/001..029) against POSTGRES_DB before starting.'
+    );
+  }
+}
+
 async function main() {
   const configCheck = validateConfig({ strict: process.env.CONFIG_STRICT === 'true' });
   configCheck.warnings.forEach(msg => logger.warn('CONFIG', msg));
   if (!configCheck.ok) {
     throw new Error(`Config validation failed: ${configCheck.errors.join(' | ')}`);
   }
+
+  await assertPgSchemaReady();
 
   const args = process.argv.slice(2);
   const simOnly = args.includes('--sim-only');
@@ -1569,8 +1614,10 @@ async function main() {
     apiServer = startAPIServer(config.server.port);
 
     const wsServer = new WebSocketServer();
-    wsServer.on('error', (err) => logger.error('WS', `WebSocket server error: ${err.message}`));
     wsServer.start(config.server.wsPort);
+    if (wsServer.server && typeof wsServer.server.on === 'function') {
+      wsServer.server.on('error', (err) => logger.error('WS', `WebSocket server error: ${err.message}`));
+    }
     wsServer.onLocationUpdate = (driverId, data) => {
       locationService.updateLocation(driverId, data);
     };

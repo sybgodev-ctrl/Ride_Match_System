@@ -17,6 +17,9 @@ const pgRepo = USE_PG ? require('../repositories/pg/pg-identity-repository') : n
 const OTP_RATE_WINDOW_MS = 10 * 60 * 1000;
 const OTP_RATE_MAX       = 5;
 
+// HMAC secret for OTP hashing. Must be non-empty in production.
+const OTP_SECRET = config.otp?.secret || '';
+
 class IdentityService {
   constructor() {
     // ── In-memory stores (mock mode only) ──
@@ -73,8 +76,20 @@ class IdentityService {
     if (USE_PG) {
       const rateRecord = await pgRepo.getRateLimit(phone);
       if (rateRecord && rateRecord.request_count >= OTP_RATE_MAX) {
-        logger.warn('IDENTITY', `OTP rate limit hit (pg) for ${phone}`);
+        logger.warn('IDENTITY', `OTP rate limit hit (pg) for ${this._maskPhone(phone)}`);
         return { success: false, error: 'Too many OTP requests. Try again later.', retryAfterSec: 60 };
+      }
+      // ── Reuse active OTP if within resend cooldown (PG) ──
+      // Check cooldown BEFORE incrementing rate limit so cooldown hits
+      // don't burn rate limit slots.
+      const cooldownOtp = await pgRepo.getActiveOtpByPhone(phone);
+      if (cooldownOtp && cooldownOtp.expiresAt > now && cooldownOtp.resendAt > now) {
+        return {
+          success: true,
+          requestId: cooldownOtp.id,
+          expiresAt: cooldownOtp.expiresAt,
+          resendAfterSec: Math.ceil((cooldownOtp.resendAt - now) / 1000),
+        };
       }
       await pgRepo.incrementRateLimit(phone);
     } else {
@@ -82,27 +97,15 @@ class IdentityService {
       if (rateRecord && (now - rateRecord.windowStart) < OTP_RATE_WINDOW_MS) {
         if (rateRecord.count >= OTP_RATE_MAX) {
           const retryAfterSec = Math.ceil((rateRecord.windowStart + OTP_RATE_WINDOW_MS - now) / 1000);
-          logger.warn('IDENTITY', `OTP rate limit hit for ${phone}`);
+          logger.warn('IDENTITY', `OTP rate limit hit for ${this._maskPhone(phone)}`);
           return { success: false, error: 'Too many OTP requests. Try again later.', retryAfterSec };
         }
         rateRecord.count++;
       } else {
         this.otpRateByPhone.set(phone, { count: 1, windowStart: now });
       }
-    }
 
-    // ── Reuse active OTP if within resend cooldown ──
-    if (USE_PG) {
-      const existing = await pgRepo.getActiveOtpByPhone(phone);
-      if (existing && existing.expiresAt > now && existing.resendAt > now) {
-        return {
-          success: true,
-          requestId: existing.id,
-          expiresAt: existing.expiresAt,
-          resendAfterSec: Math.ceil((existing.resendAt - now) / 1000),
-        };
-      }
-    } else {
+      // ── Reuse active OTP if within resend cooldown (mock) ──
       const existingId = this.otpIndexByPhone.get(phone);
       if (existingId) {
         const existing = this.otpByRequestId.get(existingId);
@@ -117,17 +120,33 @@ class IdentityService {
       }
     }
 
+    // ── Invalidate all previous pending OTPs for this phone ──
+    if (USE_PG) {
+      await pgRepo.expirePendingOtpsByPhone(phone);
+    } else {
+      const oldId = this.otpIndexByPhone.get(phone);
+      if (oldId) {
+        const old = this.otpByRequestId.get(oldId);
+        if (old && old.status === 'pending') {
+          old.status = 'expired';
+        }
+      }
+    }
+
     // ── Generate new OTP ──
-    const otpCode   = this._generateOtp();
-    const requestId = `OTP-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+    const otpCode   = this._generateOtp();           // plaintext — sent via SMS
+    const otpHash   = this._hashOtp(otpCode);        // stored in DB/memory
+    const requestId = USE_PG
+      ? crypto.randomUUID()
+      : `OTP-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
     const expiresAt = now + 120_000;
     const resendAt  = now +  30_000;
 
     if (USE_PG) {
-      await pgRepo.createOtpRequest({ requestId, phoneNumber: phone, otpCode, otpType, channel, expiresAt });
+      await pgRepo.createOtpRequest({ requestId, phoneNumber: phone, otpCode: otpHash, otpType, channel, expiresAt });
     } else {
       const request = {
-        requestId, phoneNumber: phone, otpCode, otpType, channel,
+        requestId, phoneNumber: phone, otpCode: otpHash, otpType, channel,
         status: 'pending', attempts: 0, maxAttempts: 3,
         createdAt: now, resendAt, expiresAt, verifiedAt: null,
       };
@@ -136,9 +155,9 @@ class IdentityService {
     }
 
     eventBus.publish('otp_requested', { phoneNumber: phone, requestId, otpType, channel });
-    logger.info('IDENTITY', `OTP generated for ${phone} (${requestId})`);
+    logger.info('IDENTITY', `OTP generated for ${this._maskPhone(phone)} (${requestId})`);
 
-    // Deliver OTP via SMS
+    // Deliver plaintext OTP via SMS (never the hash)
     try {
       const smsService = require('./sms-service');
       Promise.resolve(smsService.sendOtp(phone, otpCode, requestId))
@@ -155,9 +174,19 @@ class IdentityService {
   async verifyOtp({ phoneNumber, requestId, otpCode }) {
     const phone = this._normalizePhone(phoneNumber);
     const now   = Date.now();
+    let effectiveRequestId = requestId;
+
+    if (!effectiveRequestId) {
+      if (USE_PG) {
+        const active = await pgRepo.getActiveOtpByPhone(phone);
+        effectiveRequestId = active?.id;
+      } else {
+        effectiveRequestId = this.otpIndexByPhone.get(phone);
+      }
+    }
 
     if (USE_PG) {
-      const request = await pgRepo.getOtpRequest(requestId);
+      const request = await pgRepo.getOtpRequest(effectiveRequestId);
       if (!request || request.phone_number !== phone) {
         return { success: false, error: 'invalid request' };
       }
@@ -165,19 +194,22 @@ class IdentityService {
         return { success: false, error: `otp status is ${request.status}` };
       }
       if (now > request.expiresAt) {
-        await pgRepo.recordOtpAttempt(requestId, 'expired');
+        await pgRepo.recordOtpAttempt(effectiveRequestId, 'expired');
         return { success: false, error: 'otp expired' };
       }
-      if (request.otp_code !== String(otpCode || '')) {
+      // Compare against stored hash, not plaintext
+      if (request.otp_code !== this._hashOtp(String(otpCode || ''))) {
         const newStatus = (request.attempts + 1) >= request.max_attempts ? 'failed' : null;
-        const updated   = await pgRepo.recordOtpAttempt(requestId, newStatus);
+        const updated   = await pgRepo.recordOtpAttempt(effectiveRequestId, newStatus);
         return { success: false, error: 'invalid otp', attempts: updated.attempts };
       }
 
       // Correct OTP — mark verified, upsert user + session
-      await pgRepo.recordOtpAttempt(requestId, 'verified');
-      const userId = crypto.randomUUID();
-      const user   = await pgRepo.upsertUser({ userId, phoneNumber: phone, userType: 'rider' });
+      await pgRepo.recordOtpAttempt(effectiveRequestId, 'verified');
+      const existing = await pgRepo.getUserByPhone(phone);
+      const userId   = existing ? existing.id : crypto.randomUUID();
+      const isNewUser = !existing;
+      const user     = await pgRepo.upsertUser({ userId, phoneNumber: phone, userType: 'rider' });
 
       const sessionToken    = crypto.randomUUID();
       const sessionExpiresAt = now + 24 * 3600 * 1000;
@@ -190,10 +222,11 @@ class IdentityService {
         expiresAt: sessionExpiresAt,
       });
 
-      eventBus.publish('otp_verified', { requestId, userId: user.id, phoneNumber: phone });
+      eventBus.publish('otp_verified', { requestId: effectiveRequestId, userId: user.id, phoneNumber: phone });
 
       return {
         success: true,
+        isNewUser,
         user: {
           userId:        user.id,
           phoneNumber:   user.phone_number,
@@ -207,7 +240,7 @@ class IdentityService {
     }
 
     // ── Mock mode ──
-    const request = this.otpByRequestId.get(requestId);
+    const request = this.otpByRequestId.get(effectiveRequestId);
     if (!request || request.phoneNumber !== phone) {
       return { success: false, error: 'invalid request' };
     }
@@ -220,7 +253,8 @@ class IdentityService {
     }
 
     request.attempts++;
-    if (request.otpCode !== String(otpCode || '')) {
+    // Compare against stored hash, not plaintext
+    if (request.otpCode !== this._hashOtp(String(otpCode || ''))) {
       if (request.attempts >= request.maxAttempts) request.status = 'failed';
       return { success: false, error: 'invalid otp', attempts: request.attempts };
     }
@@ -228,7 +262,9 @@ class IdentityService {
     request.status     = 'verified';
     request.verifiedAt = now;
 
-    let user = this.usersByPhone.get(phone);
+    const existingUser = this.usersByPhone.get(phone);
+    const isNewUser = !existingUser;
+    let user = existingUser;
     if (!user) {
       user = {
         userId:        `USR-${crypto.randomUUID().slice(0, 8).toUpperCase()}`,
@@ -254,8 +290,8 @@ class IdentityService {
       expiresAt:   now + 24 * 3600 * 1000,
     });
 
-    eventBus.publish('otp_verified', { requestId, userId: user.userId, phoneNumber: phone });
-    return { success: true, user, sessionToken };
+    eventBus.publish('otp_verified', { requestId: effectiveRequestId, userId: user.userId, phoneNumber: phone });
+    return { success: true, isNewUser, user, sessionToken };
   }
 
   // ─── Validate Session ─────────────────────────────────────────────────────
@@ -318,6 +354,22 @@ class IdentityService {
 
   _generateOtp() {
     return String(crypto.randomInt(100000, 999999));
+  }
+
+  // HMAC-SHA256 hash of the OTP code using the server secret.
+  // Stored in DB instead of plaintext so a DB dump doesn't expose live codes.
+  _hashOtp(otpCode) {
+    if (!OTP_SECRET) {
+      // No secret configured — fall back to plaintext (dev only; validateConfig warns).
+      return String(otpCode);
+    }
+    return crypto.createHmac('sha256', OTP_SECRET).update(String(otpCode)).digest('hex');
+  }
+
+  // Mask phone for logs: +91987***89
+  _maskPhone(phone) {
+    if (!phone || phone.length < 6) return '***';
+    return phone.slice(0, 4) + '***' + phone.slice(-2);
   }
 }
 

@@ -285,7 +285,7 @@ On first startup, PostgreSQL automatically loads all 248+ tables from the `sql/`
 ### 6.4 Initialize Kafka Topics
 
 ```bash
-cd sql
+cd scripts
 ./init-topics.sh
 ```
 

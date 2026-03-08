@@ -97,6 +97,13 @@ module.exports = {
     token: process.env.GOAPP_ADMIN_TOKEN || (IS_DEVELOPMENT ? 'goapp-admin-secret' : ''),
   },
 
+  // ─── OTP Security ────────────────────────────────────────────────────────
+  // Used to HMAC-hash OTPs before DB storage so a DB dump doesn't expose live codes.
+  // Generate with: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+  otp: {
+    secret: process.env.OTP_SECRET || (IS_DEVELOPMENT ? 'dev-otp-secret-change-me-in-prod' : ''),
+  },
+
   // ─── SMS / OTP Delivery ─────────────────────────────────────────────────
   sms: {
     // Provider: 'twilio' | 'msg91' | '2factor' | 'console' (dev)
