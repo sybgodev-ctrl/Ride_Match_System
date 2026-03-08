@@ -1,5 +1,8 @@
 // GoApp Ride Service
 // Ride lifecycle state machine, idempotency, cancellation
+//
+// DB_BACKEND=mock  → rides stored in in-memory Map (zero setup)
+// DB_BACKEND=pg    → rides persisted to PostgreSQL via pg-ride-repository
 
 const crypto = require('crypto');
 const config = require('../config');
@@ -12,11 +15,14 @@ const { logger, eventBus } = require('../utils/logger');
 const driverWalletService = require('./driver-wallet-service');
 const rideSessionService  = require('./ride-session-service');
 
+const USE_PG = config.db.backend === 'pg';
+const pgRepo = USE_PG ? require('../repositories/pg/pg-ride-repository') : null;
+
 const S = config.rideStatuses;
 
 class RideService {
   constructor() {
-    this.rides = new Map(); // rideId -> ride object
+    this.rides              = new Map(); // rideId -> ride object (always maintained in-memory as hot cache)
     this.cancellationCounts = new Map(); // `${type}:${userId}` -> { count, windowStart }
   }
 
@@ -63,6 +69,20 @@ class RideService {
     };
 
     this.rides.set(rideId, ride);
+
+    // Persist to PostgreSQL (non-blocking — in-memory Map remains source of truth during the ride)
+    if (USE_PG) {
+      pgRepo.createRide({
+        rideId,
+        riderId,
+        rideType: rideType || 'sedan',
+        pickupLat, pickupLng,
+        destLat: destLng, destLng,
+        fareEstimate: fareEstimate.finalFare,
+        surgeMultiplier: estimates.surgeMultiplier,
+        idempotencyKey,
+      }).catch(err => logger.warn('RIDE', `pg createRide failed (non-fatal): ${err.message}`));
+    }
 
     // Index active ride in Redis for fast recovery lookup (4-hour TTL)
     if (riderId) redis.set(`active_ride:${riderId}`, rideId, 4 * 3600);
@@ -179,7 +199,12 @@ class RideService {
     );
     ride.finalFare = finalFare;
 
-    this._updateStatus(rideId, S.TRIP_COMPLETED);
+    this._updateStatus(rideId, S.TRIP_COMPLETED, {
+      completedAt:    ride.completedAt,
+      finalFare:      finalFare.finalFare,
+      actualDistanceM: actualDistanceKm ? Math.round(actualDistanceKm * 1000) : null,
+      actualDurationS: actualDurationMin ? Math.round(actualDurationMin * 60) : null,
+    });
 
     // Update driver stats
     const driver = matchingEngine.getDriver(ride.driverId);
@@ -394,12 +419,19 @@ class RideService {
   }
 
   // ─── Status Management ───
-  _updateStatus(rideId, newStatus) {
+  _updateStatus(rideId, newStatus, pgExtra = {}) {
     const ride = this.rides.get(rideId);
     if (!ride) return;
+    const prev = ride.statusHistory[ride.statusHistory.length - 1]?.status || 'NEW';
     ride.status = newStatus;
     ride.statusHistory.push({ status: newStatus, at: Date.now() });
-    logger.info('RIDE', `Ride ${rideId}: ${ride.statusHistory[ride.statusHistory.length - 2]?.status || 'NEW'} → ${newStatus}`);
+    logger.info('RIDE', `Ride ${rideId}: ${prev} → ${newStatus}`);
+
+    // Persist status change to PostgreSQL
+    if (USE_PG) {
+      pgRepo.updateStatus(rideId, newStatus, pgExtra)
+        .catch(err => logger.warn('RIDE', `pg updateStatus failed (non-fatal): ${err.message}`));
+    }
   }
 
   // ─── Active ride lookup by riderId (for app session recovery) ───
@@ -423,37 +455,43 @@ class RideService {
   }
 
   getRide(rideId) {
-    return this.rides.get(rideId);
+    // Hot cache first; fall back to DB
+    if (this.rides.has(rideId)) return this.rides.get(rideId);
+    if (USE_PG) return pgRepo.getRide(rideId);
+    return undefined;
   }
 
   getAllRides() {
+    if (USE_PG) return pgRepo.getAllRides();
     return [...this.rides.values()].map(r => ({
-      rideId: r.rideId,
-      riderId: r.riderId,
-      driverId: r.driverId,
-      status: r.status,
-      rideType: r.rideType,
-      fare: r.finalFare?.finalFare || r.fareEstimate?.finalFare,
+      rideId:    r.rideId,
+      riderId:   r.riderId,
+      driverId:  r.driverId,
+      status:    r.status,
+      rideType:  r.rideType,
+      fare:      r.finalFare?.finalFare || r.fareEstimate?.finalFare,
       createdAt: new Date(r.createdAt).toISOString(),
     }));
   }
 
   getStats() {
+    if (USE_PG) return pgRepo.getStats();
+
     const rides = [...this.rides.values()];
     const statuses = {};
     rides.forEach(r => { statuses[r.status] = (statuses[r.status] || 0) + 1; });
 
-    const completed = rides.filter(r => r.status === S.TRIP_COMPLETED);
+    const completed    = rides.filter(r => r.status === S.TRIP_COMPLETED);
     const totalRevenue = completed.reduce((sum, r) => sum + (r.finalFare?.finalFare || 0), 0);
     const avgMatchTime = completed.length > 0
       ? Math.round(completed.reduce((sum, r) => sum + (r.acceptedAt - r.createdAt), 0) / completed.length / 1000)
       : 0;
 
     return {
-      totalRides: rides.length,
+      totalRides:     rides.length,
       statuses,
       completedRides: completed.length,
-      totalRevenue: `₹${totalRevenue}`,
+      totalRevenue:   `₹${totalRevenue}`,
       avgMatchTimeSec: avgMatchTime,
     };
   }

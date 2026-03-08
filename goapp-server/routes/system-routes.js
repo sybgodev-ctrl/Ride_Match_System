@@ -1,7 +1,12 @@
 const { haversine, bearing } = require('../utils/formulas');
 
 function registerSystemRoutes(router, ctx) {
-  const { enterpriseConfig, repositories, services, eventBus } = ctx;
+  const { enterpriseConfig, repositories, services, eventBus, requireAdmin } = ctx;
+
+  function ensureAdmin(headers = {}) {
+    const adminCheck = requireAdmin(headers);
+    return adminCheck || null;
+  }
 
   router.register('GET', '/api/v1/health', async () => ({
     data: {
@@ -28,31 +33,48 @@ function registerSystemRoutes(router, ctx) {
     },
   }));
 
-  router.register('GET', '/api/v1/users', async ({ params }) => {
+  router.register('GET', '/api/v1/users', async ({ params, headers }) => {
+    const adminError = ensureAdmin(headers);
+    if (adminError) return adminError;
+
     const limit = Number(params.get('limit') || 20);
     return { data: { users: repositories.identity.getUsers(limit) } };
   });
 
-  router.register('GET', '/api/v1/auth/stats', async () => ({ data: repositories.identity.getStats() }));
-  router.register('GET', '/api/v1/events', async ({ params }) => {
+  router.register('GET', '/api/v1/auth/stats', async ({ headers }) => {
+    const adminError = ensureAdmin(headers);
+    if (adminError) return adminError;
+    return { data: repositories.identity.getStats() };
+  });
+  router.register('GET', '/api/v1/events', async ({ params, headers }) => {
+    const adminError = ensureAdmin(headers);
+    if (adminError) return adminError;
+
     const count = parseInt(params.get('count') || '20', 10);
     return { data: { events: eventBus.getRecentEvents(count) } };
   });
 
-  router.register('GET', '/api/v1/stats', async () => ({
-    data: {
-      redis: services.redis.getStats(),
-      identity: repositories.identity.getStats(),
-      location: services.locationService.getStats(),
-      pricing: services.pricingService.getStats(),
-      rides: services.rideService.getStats(),
-      events: { total: eventBus.events.length },
-    },
-  }));
+  router.register('GET', '/api/v1/stats', async ({ headers }) => {
+    const adminError = ensureAdmin(headers);
+    if (adminError) return adminError;
 
-  router.register('GET', '/api/v1/performance', async () => ({
-    data: services.perfMonitor.getSnapshot(services),
-  }));
+    return {
+      data: {
+        redis: services.redis.getStats(),
+        identity: repositories.identity.getStats(),
+        location: services.locationService.getStats(),
+        pricing: services.pricingService.getStats(),
+        rides: services.rideService.getStats(),
+        events: { total: eventBus.events.length },
+      },
+    };
+  });
+
+  router.register('GET', '/api/v1/performance', async ({ headers }) => {
+    const adminError = ensureAdmin(headers);
+    if (adminError) return adminError;
+    return { data: services.perfMonitor.getSnapshot(services) };
+  });
 
   router.register('GET', '/api/v1/formulas/haversine', async ({ params }) => {
     const lat1 = parseFloat(params.get('lat1'));

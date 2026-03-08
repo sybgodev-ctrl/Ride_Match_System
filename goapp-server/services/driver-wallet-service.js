@@ -7,7 +7,11 @@
 //   - Platform deducts commission from driver wallet after each ride
 //   - Admin can credit/debit driver wallet
 
+const config = require('../config');
 const { logger, eventBus } = require('../utils/logger');
+
+const USE_PG = config.db.backend === 'pg';
+const pgRepo = USE_PG ? require('../repositories/pg/pg-driver-wallet-repository') : null;
 
 const DRIVER_MIN_BALANCE = parseFloat(process.env.DRIVER_MIN_WALLET_BALANCE || '300');
 
@@ -48,19 +52,15 @@ class DriverWalletService {
   }
 
   // ─── Get driver wallet balance ────────────────────────────────────────────
-  getBalance(driverId) {
+  async getBalance(driverId) {
+    if (USE_PG) {
+      const row = await pgRepo.getBalance(driverId);
+      if (!row) return { driverId, balance: 0, minRequired: DRIVER_MIN_BALANCE, canReceiveRide: false, shortfall: DRIVER_MIN_BALANCE };
+      const balance = parseFloat(row.balance || 0);
+      return { driverId, balance, minRequired: DRIVER_MIN_BALANCE, canReceiveRide: balance >= DRIVER_MIN_BALANCE, shortfall: balance < DRIVER_MIN_BALANCE ? Math.round((DRIVER_MIN_BALANCE - balance) * 100) / 100 : 0, totalEarned: parseFloat(row.total_earned || 0), totalDeducted: parseFloat(row.total_deducted || 0) };
+    }
     const wallet = this._getWallet(driverId);
-    return {
-      driverId,
-      balance: wallet.balance,
-      minRequired: DRIVER_MIN_BALANCE,
-      canReceiveRide: wallet.balance >= DRIVER_MIN_BALANCE,
-      shortfall: wallet.balance < DRIVER_MIN_BALANCE
-        ? Math.round((DRIVER_MIN_BALANCE - wallet.balance) * 100) / 100
-        : 0,
-      totalEarned: wallet.totalEarned,
-      totalDeducted: wallet.totalDeducted,
-    };
+    return { driverId, balance: wallet.balance, minRequired: DRIVER_MIN_BALANCE, canReceiveRide: wallet.balance >= DRIVER_MIN_BALANCE, shortfall: wallet.balance < DRIVER_MIN_BALANCE ? Math.round((DRIVER_MIN_BALANCE - wallet.balance) * 100) / 100 : 0, totalEarned: wallet.totalEarned, totalDeducted: wallet.totalDeducted };
   }
 
   // ─── Driver recharges wallet ──────────────────────────────────────────────
@@ -118,69 +118,56 @@ class DriverWalletService {
   }
 
   // ─── Deduct commission/platform fee from driver wallet ───────────────────
-  deductCommission(driverId, amount, rideId, reason = 'platform_commission') {
+  async deductCommission(driverId, amount, rideId, reason = 'platform_commission') {
     if (!amount || amount <= 0) return { success: false, error: 'Invalid deduction amount.' };
+
+    const tx = { type: 'commission_deduction', amountInr: amount, rideId, reason, createdAt: new Date().toISOString() };
+
+    if (USE_PG) {
+      const row = await pgRepo.adjustAndRecord(driverId, -amount, tx).catch(err => { logger.warn('DRIVER_WALLET', `pg deductCommission failed: ${err.message}`); return null; });
+      const balance = row ? parseFloat(row.balance) : 0;
+      const belowMin = balance < DRIVER_MIN_BALANCE;
+      if (belowMin) eventBus.publish('driver_wallet_low', { driverId, balance, minRequired: DRIVER_MIN_BALANCE });
+      logger.info('DRIVER_WALLET', `Driver ${driverId} commission ₹${amount} deducted (ride ${rideId})`);
+      return { success: true, transaction: { txId: `DRV-COM-${Date.now()}`, ...tx }, balance, canReceiveRide: !belowMin };
+    }
 
     const wallet = this._getWallet(driverId);
     wallet.balance = Math.max(0, Math.round((wallet.balance - amount) * 100) / 100);
     wallet.totalDeducted += amount;
-
-    const tx = {
-      txId: `DRV-COM-${Date.now()}`,
-      type: 'commission_deduction',
-      amountInr: amount,
-      rideId,
-      reason,
-      balanceAfter: wallet.balance,
-      createdAt: new Date().toISOString(),
-    };
-    wallet.transactions.push(tx);
+    const fullTx = { txId: `DRV-COM-${Date.now()}`, ...tx, balanceAfter: wallet.balance };
+    wallet.transactions.push(fullTx);
 
     const belowMin = wallet.balance < DRIVER_MIN_BALANCE;
     if (belowMin) {
-      eventBus.publish('driver_wallet_low', {
-        driverId,
-        balance: wallet.balance,
-        minRequired: DRIVER_MIN_BALANCE,
-        shortfall: Math.round((DRIVER_MIN_BALANCE - wallet.balance) * 100) / 100,
-      });
+      eventBus.publish('driver_wallet_low', { driverId, balance: wallet.balance, minRequired: DRIVER_MIN_BALANCE, shortfall: Math.round((DRIVER_MIN_BALANCE - wallet.balance) * 100) / 100 });
       logger.warn('DRIVER_WALLET', `Driver ${driverId} wallet below minimum after commission. Balance: ₹${wallet.balance}. Rides blocked until recharge.`);
     }
-
-    return {
-      success: true,
-      transaction: tx,
-      balance: wallet.balance,
-      canReceiveRide: !belowMin,
-      warning: belowMin
-        ? `Balance below ₹${DRIVER_MIN_BALANCE}. Recharge to continue receiving rides.`
-        : null,
-    };
+    return { success: true, transaction: fullTx, balance: wallet.balance, canReceiveRide: !belowMin, warning: belowMin ? `Balance below ₹${DRIVER_MIN_BALANCE}. Recharge to continue receiving rides.` : null };
   }
 
   // ─── Credit earnings to driver wallet (ride fare share) ──────────────────
-  creditEarnings(driverId, amount, rideId, reason = 'ride_earnings') {
+  async creditEarnings(driverId, amount, rideId, reason = 'ride_earnings') {
     if (!amount || amount <= 0) return { success: false, error: 'Invalid earnings amount.' };
+
+    const tx = { type: 'ride_earnings', amountInr: amount, rideId, reason, createdAt: new Date().toISOString() };
+
+    if (USE_PG) {
+      const row = await pgRepo.adjustAndRecord(driverId, amount, tx).catch(err => { logger.warn('DRIVER_WALLET', `pg creditEarnings failed: ${err.message}`); return null; });
+      const balance = row ? parseFloat(row.balance) : 0;
+      eventBus.publish('driver_earnings_credited', { driverId, amount, rideId, balance });
+      logger.info('DRIVER_WALLET', `Driver ${driverId} earned ₹${amount} (ride ${rideId})`);
+      return { success: true, transaction: { txId: `DRV-EARN-${Date.now()}`, ...tx }, balance };
+    }
 
     const wallet = this._getWallet(driverId);
     wallet.balance = Math.round((wallet.balance + amount) * 100) / 100;
     wallet.totalEarned += amount;
-
-    const tx = {
-      txId: `DRV-EARN-${Date.now()}`,
-      type: 'ride_earnings',
-      amountInr: amount,
-      rideId,
-      reason,
-      balanceAfter: wallet.balance,
-      createdAt: new Date().toISOString(),
-    };
-    wallet.transactions.push(tx);
-
+    const fullTx = { txId: `DRV-EARN-${Date.now()}`, ...tx, balanceAfter: wallet.balance };
+    wallet.transactions.push(fullTx);
     eventBus.publish('driver_earnings_credited', { driverId, amount, rideId, balance: wallet.balance });
     logger.info('DRIVER_WALLET', `Driver ${driverId} earned ₹${amount} (ride ${rideId}). Balance: ₹${wallet.balance}`);
-
-    return { success: true, transaction: tx, balance: wallet.balance };
+    return { success: true, transaction: fullTx, balance: wallet.balance };
   }
 
   // ─── Credit incentive/bonus to driver wallet ─────────────────────────────
@@ -239,22 +226,12 @@ class DriverWalletService {
   }
 
   // ─── Global stats ─────────────────────────────────────────────────────────
-  getStats() {
-    let totalBalance = 0;
-    let totalDrivers = 0;
-    let blockedDrivers = 0;
-    this.wallets.forEach(w => {
-      totalBalance += w.balance;
-      totalDrivers++;
-      if (w.balance < DRIVER_MIN_BALANCE) blockedDrivers++;
-    });
-    return {
-      totalDrivers,
-      blockedDrivers,
-      eligibleDrivers: totalDrivers - blockedDrivers,
-      totalBalanceInWallets: Math.round(totalBalance * 100) / 100,
-      minBalanceRequired: DRIVER_MIN_BALANCE,
-    };
+  async getStats() {
+    if (USE_PG) return pgRepo.getStats();
+
+    let totalBalance = 0, totalDrivers = 0, blockedDrivers = 0;
+    this.wallets.forEach(w => { totalBalance += w.balance; totalDrivers++; if (w.balance < DRIVER_MIN_BALANCE) blockedDrivers++; });
+    return { totalDrivers, blockedDrivers, eligibleDrivers: totalDrivers - blockedDrivers, totalBalanceInWallets: Math.round(totalBalance * 100) / 100, minBalanceRequired: DRIVER_MIN_BALANCE };
   }
 }
 

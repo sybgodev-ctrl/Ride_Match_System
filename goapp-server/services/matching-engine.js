@@ -72,7 +72,7 @@ class MatchingEngine {
       });
 
       // Step 1: Find nearby available drivers
-      const nearbyDrivers = this._findCandidates(ride, stage);
+      const nearbyDrivers = await this._findCandidates(ride, stage);
 
       if (nearbyDrivers.length === 0) {
         logger.warn('MATCHING', `  └─ Stage ${stage.stage}: No drivers found in ${stage.radiusKm}km radius`);
@@ -121,12 +121,12 @@ class MatchingEngine {
   // ═══════════════════════════════════════════
   // STEP 1: Find candidate drivers
   // ═══════════════════════════════════════════
-  _findCandidates(ride, stage) {
+  async _findCandidates(ride, stage) {
     const { pickupLat, pickupLng, rideType } = ride;
     const excluded = this.excludedDrivers.get(ride.rideId) || new Set();
 
     // Query Redis GEO
-    const nearby = locationService.findNearby(
+    const nearby = await locationService.findNearby(
       pickupLat, pickupLng, stage.radiusKm, stage.maxDrivers * 3 // get extra for filtering
     );
 
@@ -241,12 +241,12 @@ class MatchingEngine {
         return;
       }
 
-      var acceptTimer = setTimeout(() => {
+      var acceptTimer = setTimeout(async () => {
         clearTimeout(timeout);
 
         // First responding driver tries to claim
         const winner = respondingDrivers[0];
-        const lockResult = this._claimRide(rideId, winner.driverId);
+        const lockResult = await this._claimRide(rideId, winner.driverId);
 
         if (lockResult.acquired) {
           // Notify other drivers
@@ -286,8 +286,8 @@ class MatchingEngine {
   // ═══════════════════════════════════════════
   // Distributed Lock (SETNX)
   // ═══════════════════════════════════════════
-  _claimRide(rideId, driverId) {
-    const lockResult = redis.acquireLock(rideId, driverId, 60);
+  async _claimRide(rideId, driverId) {
+    const lockResult = await redis.acquireLock(rideId, driverId, 60);
 
     if (lockResult.acquired) {
       eventBus.publish('ride_accepted', { rideId, driverId });

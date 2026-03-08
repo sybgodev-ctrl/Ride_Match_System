@@ -147,7 +147,7 @@ class Simulator {
     logger.info('LOCATION', `Searching for drivers near T. Nagar (${center.lat}, ${center.lng}):`);
 
     for (const stage of config.matching.stages) {
-      const nearby = locationService.findNearby(center.lat, center.lng, stage.radiusKm, 20);
+      const nearby = await locationService.findNearby(center.lat, center.lng, stage.radiusKm, 20);
       console.log(`\n  Stage ${stage.stage} (${stage.radiusKm}km radius): ${nearby.length} drivers found`);
       nearby.slice(0, 5).forEach(d => {
         const driver = matchingEngine.getDriver(d.driverId);

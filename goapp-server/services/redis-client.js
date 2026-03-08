@@ -76,6 +76,20 @@ if (BACKEND !== 'real') {
     await client.set(key, JSON.stringify(result), { EX: ttlSec });
   };
 
+  // redis-mock compatibility: geoadd(key, lng, lat, member)
+  client.geoadd = async (key, lng, lat, member) => {
+    return client.geoAdd(key, {
+      longitude: Number(lng),
+      latitude: Number(lat),
+      member: String(member),
+    });
+  };
+
+  // redis-mock compatibility: georemove(key, member)
+  client.georemove = async (key, member) => {
+    return client.zRem(key, String(member));
+  };
+
   // georadius shim: redis-mock uses Haversine internally.
   // Real Redis 7 uses GEOSEARCH (GEORADIUS is deprecated in Redis 6+).
   // Normalises output to the same shape as redis-mock.georadius:

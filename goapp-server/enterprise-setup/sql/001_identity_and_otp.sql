@@ -149,7 +149,7 @@ CREATE INDEX IF NOT EXISTS idx_security_logs_user ON user_security_logs(user_id,
 CREATE TABLE IF NOT EXISTS otp_requests (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     phone_number        VARCHAR(20) NOT NULL,
-    otp_code            VARCHAR(10) NOT NULL,
+    otp_code            VARCHAR(64) NOT NULL,
     otp_type            VARCHAR(20) NOT NULL CHECK (otp_type IN ('login','signup','reset','verify')),
     channel             VARCHAR(10) CHECK (channel IN ('sms','whatsapp','voice')),
     status              VARCHAR(20) DEFAULT 'pending'

@@ -15,6 +15,7 @@ DB_PASS="${DB_PASS:-goapp}"
 export PGPASSWORD="$DB_PASS"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SETUP_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 echo "============================================"
 echo "GoApp Enterprise Schema Migration"
@@ -24,29 +25,69 @@ echo "Database: $DB_NAME"
 echo "User: $DB_USER"
 echo ""
 
-# Migration files in order
-MIGRATIONS=(
-    "001_identity_and_otp.sql"
-    "002_driver_service.sql"
-    "003_rider_service.sql"
-    "004_ride_service.sql"
-    "005_dispatch_matching.sql"
-    "006_location_service.sql"
-    "007_pricing_service.sql"
-    "008_payment_wallet.sql"
-    "009_driver_incentives.sql"
-    "010_notification_service.sql"
-    "011_fraud_risk.sql"
-    "012_promotions_referrals.sql"
-    "013_safety_sos.sql"
-    "014_scheduling.sql"
-    "015_corporate_b2b.sql"
-    "016_support.sql"
-    "017_compliance.sql"
-    "018_saga_orchestration.sql"
-    "019_event_system.sql"
-    "020_analytics_warehouse.sql"
-)
+if command -v psql >/dev/null 2>&1; then
+    RUN_MODE="local_psql"
+    echo "Mode: local psql"
+else
+    RUN_MODE="docker_psql"
+    echo "Mode: docker compose exec postgres psql"
+fi
+echo ""
+
+run_psql_file() {
+    local sql_file="$1"
+    if [ "$RUN_MODE" = "local_psql" ]; then
+        psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f "$sql_file"
+    else
+        docker compose -f "$SETUP_DIR/docker-compose.yml" exec -T postgres \
+            psql -U "$DB_USER" -d "$DB_NAME" -f "/docker-entrypoint-initdb.d/$(basename "$sql_file")"
+    fi
+}
+
+run_psql_cmd() {
+    local sql_cmd="$1"
+    if [ "$RUN_MODE" = "local_psql" ]; then
+        psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -t -c "$sql_cmd"
+    else
+        docker compose -f "$SETUP_DIR/docker-compose.yml" exec -T postgres \
+            psql -U "$DB_USER" -d "$DB_NAME" -t -c "$sql_cmd"
+    fi
+}
+
+# Discover migration files dynamically and execute in lexical order.
+# Expected range: 001..029
+MIGRATIONS=()
+for f in "$SCRIPT_DIR"/[0-9][0-9][0-9]_*.sql; do
+    [ -e "$f" ] || continue
+    MIGRATIONS+=("$(basename "$f")")
+done
+
+if [ "${#MIGRATIONS[@]}" -eq 0 ]; then
+    echo "No migration files found in $SCRIPT_DIR"
+    exit 1
+fi
+
+IFS=$'\n' MIGRATIONS=($(printf "%s\n" "${MIGRATIONS[@]}" | sort))
+unset IFS
+
+MISSING_PREFIXES=()
+for n in $(seq 1 29); do
+    prefix=$(printf "%03d" "$n")
+    found=0
+    for file in "${MIGRATIONS[@]}"; do
+        case "$file" in
+            "${prefix}"_*) found=1; break ;;
+        esac
+    done
+    if [ "$found" -eq 0 ]; then
+        MISSING_PREFIXES+=("$prefix")
+    fi
+done
+
+if [ "${#MISSING_PREFIXES[@]}" -gt 0 ]; then
+    echo "Missing expected migration prefixes: ${MISSING_PREFIXES[*]}"
+    exit 1
+fi
 
 TOTAL=${#MIGRATIONS[@]}
 SUCCESS=0
@@ -57,7 +98,7 @@ for i in "${!MIGRATIONS[@]}"; do
     NUM=$((i + 1))
     echo "[$NUM/$TOTAL] Running: $FILE"
 
-    if psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f "$SCRIPT_DIR/$FILE" > /dev/null 2>&1; then
+    if run_psql_file "$SCRIPT_DIR/$FILE" > /dev/null 2>&1; then
         echo "  ✓ Success"
         SUCCESS=$((SUCCESS + 1))
     else
@@ -77,7 +118,7 @@ echo "Failed:  $FAILED"
 echo ""
 
 # Count tables
-TABLE_COUNT=$(psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -t -c \
+TABLE_COUNT=$(run_psql_cmd \
     "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE';" 2>/dev/null | tr -d ' ')
 
 echo "Tables created: $TABLE_COUNT / 248"

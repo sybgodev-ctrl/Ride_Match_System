@@ -2,14 +2,37 @@
 // Endpoints for uploading, listing, verifying, and serving driver KYC documents.
 
 function registerDriverDocumentRoutes(router, ctx) {
-  const { services, requireAdmin } = ctx;
+  const { services, requireAdmin, requireAuth } = ctx;
   const docService = services.driverDocumentService;
+
+  function hasAdminToken(headers) {
+    return Boolean((headers || {})['x-admin-token']);
+  }
+
+  async function ensureDocumentAccess(headers, driverId) {
+    const reqHeaders = headers || {};
+    if (hasAdminToken(reqHeaders)) {
+      const adminCheck = requireAdmin(reqHeaders);
+      if (adminCheck) return adminCheck;
+      return null;
+    }
+
+    const auth = await requireAuth(reqHeaders);
+    if (auth.error) return auth.error;
+    if (auth.session.userId !== driverId) {
+      return { status: 403, data: { error: 'Forbidden: cannot access another driver documents.' } };
+    }
+    return null;
+  }
 
   // ─── Upload a document (multipart/form-data) ───
   // Fields: document_type, document_number (optional), expiry_date (optional)
   // File field: file
-  router.register('POST', '/api/v1/drivers/:driverId/documents', async ({ pathParams, body, files }) => {
+  router.register('POST', '/api/v1/drivers/:driverId/documents', async ({ pathParams, body, files, headers }) => {
     const { driverId } = pathParams;
+    const accessError = await ensureDocumentAccess(headers, driverId);
+    if (accessError) return accessError;
+
     const documentType = body.document_type;
     const documentNumber = body.document_number || null;
     const expiryDate = body.expiry_date || null;
@@ -34,14 +57,19 @@ function registerDriverDocumentRoutes(router, ctx) {
   });
 
   // ─── List all documents for a driver ───
-  router.register('GET', '/api/v1/drivers/:driverId/documents', async ({ pathParams }) => {
+  router.register('GET', '/api/v1/drivers/:driverId/documents', async ({ pathParams, headers }) => {
+    const accessError = await ensureDocumentAccess(headers, pathParams.driverId);
+    if (accessError) return accessError;
     const result = docService.listDocuments(pathParams.driverId);
     return { data: result };
   });
 
   // ─── Get a single document record ───
-  router.register('GET', '/api/v1/drivers/:driverId/documents/:docId', async ({ pathParams }) => {
+  router.register('GET', '/api/v1/drivers/:driverId/documents/:docId', async ({ pathParams, headers }) => {
     const { driverId, docId } = pathParams;
+    const accessError = await ensureDocumentAccess(headers, driverId);
+    if (accessError) return accessError;
+
     const result = docService.getDocument(driverId, docId);
     if (!result.success) return { status: result.status || 404, data: { error: result.error } };
     return { data: result.document };
@@ -49,8 +77,11 @@ function registerDriverDocumentRoutes(router, ctx) {
 
   // ─── Serve the raw file (binary) ───
   // Returns { raw: true, ... } — server.js handles sending binary response.
-  router.register('GET', '/api/v1/drivers/:driverId/documents/:docId/file', async ({ pathParams }) => {
+  router.register('GET', '/api/v1/drivers/:driverId/documents/:docId/file', async ({ pathParams, headers }) => {
     const { driverId, docId } = pathParams;
+    const accessError = await ensureDocumentAccess(headers, driverId);
+    if (accessError) return accessError;
+
     const result = await docService.getDocumentFile(driverId, docId);
     if (!result.success) return { status: result.status || 404, data: { error: result.error } };
     return {
@@ -78,8 +109,11 @@ function registerDriverDocumentRoutes(router, ctx) {
   });
 
   // ─── Delete a document ───
-  router.register('DELETE', '/api/v1/drivers/:driverId/documents/:docId', async ({ pathParams }) => {
+  router.register('DELETE', '/api/v1/drivers/:driverId/documents/:docId', async ({ pathParams, headers }) => {
     const { driverId, docId } = pathParams;
+    const accessError = await ensureDocumentAccess(headers, driverId);
+    if (accessError) return accessError;
+
     const result = await docService.deleteDocument(driverId, docId);
     if (!result.success) return { status: result.status || 400, data: { error: result.error } };
     return { data: result };

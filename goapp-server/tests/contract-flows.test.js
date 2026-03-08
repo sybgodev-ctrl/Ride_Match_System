@@ -23,6 +23,24 @@ async function api(path, { method = 'GET', body, headers = {} } = {}) {
   return { status: res.status, json };
 }
 
+async function createSessionToken(phoneNumber) {
+  const requestRes = await api('/api/v1/auth/otp/request', {
+    method: 'POST',
+    body: { phoneNumber, otpType: 'login' },
+  });
+
+  const pending = identityService.otpByRequestId.get(requestRes.json.requestId);
+  const verifyRes = await api('/api/v1/auth/otp/verify', {
+    method: 'POST',
+    body: {
+      phoneNumber,
+      requestId: requestRes.json.requestId,
+      otpCode: pending?.otpCode,
+    },
+  });
+  return { requestRes, verifyRes };
+}
+
 test.before(async () => {
   bootstrapTestData();
   matchingEngine.registerDriver({
@@ -34,7 +52,7 @@ test.before(async () => {
     acceptanceRate: 0.95,
     completionRate: 0.98,
     rating: 4.9,
-    lastRideEndTime: Date.now() - 60 * 60 * 1000,
+    lastTripEndTime: Date.now() - 60 * 60 * 1000,
   });
   locationService.updateLocation('DRV-CONTRACT-1', {
     lat: 12.9716,
@@ -56,41 +74,65 @@ test.after(async () => {
 
 test('contract: OTP request -> verify issues session token', async () => {
   const phoneNumber = '+919111111111';
-  const requestRes = await api('/api/v1/auth/otp/request', {
-    method: 'POST',
-    body: { phoneNumber, otpType: 'login' },
-  });
-
+  const { requestRes, verifyRes } = await createSessionToken(phoneNumber);
   assert.equal(requestRes.status, 200);
   assert.equal(requestRes.json.success, true);
   assert.ok(requestRes.json.requestId);
-
-  const pending = identityService.otpByRequestId.get(requestRes.json.requestId);
-  assert.ok(pending?.otpCode, 'otp code should be stored in identity service');
-
-  const verifyRes = await api('/api/v1/auth/otp/verify', {
-    method: 'POST',
-    body: {
-      phoneNumber,
-      requestId: requestRes.json.requestId,
-      otpCode: pending.otpCode,
-    },
-  });
-
   assert.equal(verifyRes.status, 200);
   assert.equal(verifyRes.json.success, true);
   assert.ok(verifyRes.json.sessionToken);
 });
 
+test('contract: rider auth API shape request-otp -> login', async () => {
+  const phone = '9876543210';
+  const countryCode = '+91';
+  const requestRes = await api('/api/v1/auth/request-otp', {
+    method: 'POST',
+    body: { phone, countryCode, channel: 'sms' },
+  });
+  assert.equal(requestRes.status, 200);
+  assert.equal(requestRes.json.success, true);
+  assert.ok(requestRes.json.data?.requestId);
+  assert.equal(typeof requestRes.json.data?.expiresInSec, 'number');
+
+  const combinedPhone = `${countryCode}${phone}`;
+  const pending = identityService.otpByRequestId.get(requestRes.json.data.requestId);
+  const otp = pending?.otpCode;
+  assert.ok(otp);
+
+  const loginRes = await api('/api/v1/auth/login', {
+    method: 'POST',
+    body: {
+      phone,
+      countryCode,
+      otp,
+      deviceId: 'android-2f3a9c',
+      platform: 'android',
+      fcmToken: 'fcm_token_optional',
+    },
+  });
+
+  assert.equal(loginRes.status, 200);
+  assert.equal(loginRes.json.success, true);
+  assert.equal(loginRes.json.message, 'Login successful');
+  assert.ok(loginRes.json.data?.accessToken);
+  assert.ok(loginRes.json.data?.refreshToken);
+  assert.equal(loginRes.json.data?.user?.phone, combinedPhone.replace(/^\+/, ''));
+});
+
 test('contract: ride request -> matched/driver arriving', async () => {
+  const { verifyRes } = await createSessionToken('+919222222222');
+  const sessionToken = verifyRes.json.sessionToken;
+  const riderUserId = verifyRes.json.user.userId;
   const oldRandom = Math.random;
   Math.random = () => 0.9;
 
   try {
     const rideRes = await api('/api/v1/rides/request', {
       method: 'POST',
+      headers: { Authorization: `Bearer ${sessionToken}` },
       body: {
-        riderId: 'RIDER-CONTRACT-1',
+        riderId: riderUserId,
         pickupLat: 12.9716,
         pickupLng: 77.5946,
         destLat: 12.9352,
@@ -109,14 +151,18 @@ test('contract: ride request -> matched/driver arriving', async () => {
 });
 
 test('contract: cancel ride + wallet refund endpoint', async () => {
+  const { verifyRes } = await createSessionToken('+919333333333');
+  const sessionToken = verifyRes.json.sessionToken;
+  const riderUserId = verifyRes.json.user.userId;
   matchingEngine.updateDriverStatus('DRV-CONTRACT-1', 'online');
   const oldRandom = Math.random;
   Math.random = () => 0.9;
 
   const createRes = await api('/api/v1/rides/request', {
     method: 'POST',
+    headers: { Authorization: `Bearer ${sessionToken}` },
     body: {
-      riderId: 'RIDER-CONTRACT-2',
+      riderId: riderUserId,
       pickupLat: 12.9716,
       pickupLng: 77.5946,
       destLat: 12.9616,
@@ -132,14 +178,16 @@ test('contract: cancel ride + wallet refund endpoint', async () => {
 
   const cancelRes = await api(`/api/v1/rides/${rideId}/cancel`, {
     method: 'POST',
-    body: { cancelledBy: 'rider', userId: 'RIDER-CONTRACT-2' },
+    headers: { Authorization: `Bearer ${sessionToken}` },
+    body: { cancelledBy: 'rider', userId: riderUserId },
   });
 
   assert.equal(cancelRes.status, 200);
   assert.equal(cancelRes.json.success, true);
 
-  const refundRes = await api('/api/v1/wallet/RIDER-CONTRACT-2/refund', {
+  const refundRes = await api(`/api/v1/wallet/${riderUserId}/refund`, {
     method: 'POST',
+    headers: { Authorization: `Bearer ${sessionToken}` },
     body: { amount: 25, rideId, reason: 'contract_test' },
   });
 

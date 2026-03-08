@@ -1,4 +1,7 @@
 // GoApp Wallet / Coins Service
+// DB_BACKEND=mock  → in-memory Maps (zero setup)
+// DB_BACKEND=pg    → PostgreSQL via pg-wallet-repository
+//
 // Rider wallet supports:
 //   - Coin wallet: earned from rides, redeemable as discounts
 //   - Cash wallet: topup via UPI/Card, pay directly for rides
@@ -15,232 +18,197 @@
 //   - Can pay full ride fare from wallet balance
 //   - Admin can credit/debit cash wallet
 
+const config = require('../config');
 const { logger, eventBus } = require('../utils/logger');
 
-const COIN_INR_VALUE     = parseFloat(process.env.COIN_INR_VALUE    || '0.10');  // ₹ per coin
-const COINS_PER_INR_EARN = parseFloat(process.env.COINS_PER_INR_EARN || '10');   // earn 1 coin per ₹10
-const MIN_REDEEM_COINS   = parseInt(process.env.MIN_REDEEM_COINS    || '10', 10);
-const MAX_REDEEM_PCT     = parseFloat(process.env.MAX_REDEEM_PCT     || '0.20'); // max 20% of fare
+const USE_PG = config.db.backend === 'pg';
+const pgRepo = USE_PG ? require('../repositories/pg/pg-wallet-repository') : null;
 
-// Maximum transaction history kept per wallet (circular buffer cap)
+const COIN_INR_VALUE     = parseFloat(process.env.COIN_INR_VALUE    || '0.10');
+const COINS_PER_INR_EARN = parseFloat(process.env.COINS_PER_INR_EARN || '10');
+const MIN_REDEEM_COINS   = parseInt(process.env.MIN_REDEEM_COINS    || '10', 10);
+const MAX_REDEEM_PCT     = parseFloat(process.env.MAX_REDEEM_PCT     || '0.20');
 const MAX_WALLET_TRANSACTIONS = 100;
 
 class WalletService {
   constructor() {
-    // userId -> { coinBalance, cashBalance, transactions[] }
-    this.wallets = new Map();
+    this.wallets = new Map(); // userId -> { coinBalance, cashBalance, transactions[] }
   }
 
-  // ─── Get or create wallet ────────────────────────────────────────────────
   _getWallet(userId) {
     if (!this.wallets.has(userId)) {
-      this.wallets.set(userId, {
-        userId,
-        coinBalance: 0,
-        cashBalance: 0,
-        transactions: [],
-      });
+      this.wallets.set(userId, { userId, coinBalance: 0, cashBalance: 0, transactions: [] });
     }
     return this.wallets.get(userId);
   }
 
-  // ─── Record a transaction, keeping only the last MAX_WALLET_TRANSACTIONS ─
   _recordTx(wallet, tx) {
     wallet.transactions.push(tx);
-    if (wallet.transactions.length > MAX_WALLET_TRANSACTIONS) {
-      wallet.transactions.shift(); // drop oldest
-    }
+    if (wallet.transactions.length > MAX_WALLET_TRANSACTIONS) wallet.transactions.shift();
   }
 
-  getBalance(userId) {
+  async getBalance(userId) {
+    if (USE_PG) {
+      const row = await pgRepo.getBalance(userId);
+      return {
+        userId,
+        coinBalance:    parseFloat(row.coin_balance || 0),
+        coinInrValue:   COIN_INR_VALUE,
+        coinBalanceInr: Math.round(parseFloat(row.coin_balance || 0) * COIN_INR_VALUE * 100) / 100,
+        cashBalance:    parseFloat(row.cash_balance || 0),
+        totalValueInr:  Math.round((parseFloat(row.coin_balance || 0) * COIN_INR_VALUE + parseFloat(row.cash_balance || 0)) * 100) / 100,
+      };
+    }
     const wallet = this._getWallet(userId);
     return {
       userId,
-      coinBalance: wallet.coinBalance,
-      coinInrValue: COIN_INR_VALUE,
+      coinBalance:    wallet.coinBalance,
+      coinInrValue:   COIN_INR_VALUE,
       coinBalanceInr: Math.round(wallet.coinBalance * COIN_INR_VALUE * 100) / 100,
-      cashBalance: wallet.cashBalance,
-      totalValueInr: Math.round((wallet.coinBalance * COIN_INR_VALUE + wallet.cashBalance) * 100) / 100,
+      cashBalance:    wallet.cashBalance,
+      totalValueInr:  Math.round((wallet.coinBalance * COIN_INR_VALUE + wallet.cashBalance) * 100) / 100,
     };
   }
 
   // ─── Earn coins after trip completion ────────────────────────────────────
-  earnCoins(userId, fareInr, rideId) {
+  async earnCoins(userId, fareInr, rideId) {
     if (!userId || !fareInr || fareInr <= 0) return null;
 
     const earned = Math.floor(fareInr / COINS_PER_INR_EARN);
     if (earned <= 0) return null;
 
+    const tx = { type: 'coin_earn', coins: earned, rideId, fareInr, createdAt: new Date().toISOString() };
+
+    if (USE_PG) {
+      await pgRepo._ensureWallet(userId);
+      const balances = await pgRepo.adjustAndRecord(userId, { coinDelta: earned }, tx);
+      eventBus.publish('coins_earned', { userId, coins: earned, rideId, balance: balances.coinBalance });
+      logger.info('WALLET', `User ${userId} earned ${earned} coins (ride ${rideId})`);
+      return { ...tx, txId: `TXN-EARN-${Date.now()}`, coinBalanceAfter: balances.coinBalance };
+    }
+
     const wallet = this._getWallet(userId);
     wallet.coinBalance += earned;
-
-    const tx = {
-      txId: `TXN-EARN-${Date.now()}`,
-      type: 'coin_earn',
-      coins: earned,
-      rideId,
-      fareInr,
-      coinBalanceAfter: wallet.coinBalance,
-      cashBalanceAfter: wallet.cashBalance,
-      createdAt: new Date().toISOString(),
-    };
-    this._recordTx(wallet, tx);
-
+    const fullTx = { txId: `TXN-EARN-${Date.now()}`, ...tx, coinBalanceAfter: wallet.coinBalance, cashBalanceAfter: wallet.cashBalance };
+    this._recordTx(wallet, fullTx);
     eventBus.publish('coins_earned', { userId, coins: earned, rideId, balance: wallet.coinBalance });
     logger.info('WALLET', `User ${userId} earned ${earned} coins (ride ${rideId}). Coin balance: ${wallet.coinBalance}`);
-
-    return tx;
+    return fullTx;
   }
 
   // ─── Redeem coins (optional during payment) ───────────────────────────────
   // Returns { coinsRedeemed, discountInr, finalFare } or error
-  redeemCoins(userId, originalFareInr, coinsToUse) {
-    const wallet = this._getWallet(userId);
+  async redeemCoins(userId, originalFareInr, coinsToUse) {
+    const bal     = USE_PG ? await this.getBalance(userId) : null;
+    const wallet  = USE_PG ? null : this._getWallet(userId);
+    const coinBal = USE_PG ? bal.coinBalance : wallet.coinBalance;
 
-    if (wallet.coinBalance < MIN_REDEEM_COINS) {
-      return { success: false, error: `Minimum ${MIN_REDEEM_COINS} coins required to redeem.`, coinBalance: wallet.coinBalance };
+    if (coinBal < MIN_REDEEM_COINS) {
+      return { success: false, error: `Minimum ${MIN_REDEEM_COINS} coins required to redeem.`, coinBalance: coinBal };
     }
 
     const maxAllowed = Math.min(
-      wallet.coinBalance,
-      coinsToUse || wallet.coinBalance,
+      coinBal,
+      coinsToUse || coinBal,
       Math.floor((originalFareInr * MAX_REDEEM_PCT) / COIN_INR_VALUE)
     );
 
     if (maxAllowed <= 0) {
-      return { success: false, error: 'No eligible coins for this fare.', coinBalance: wallet.coinBalance };
+      return { success: false, error: 'No eligible coins for this fare.', coinBalance: coinBal };
     }
 
-    const discountInr   = Math.round(maxAllowed * COIN_INR_VALUE * 100) / 100;
-    const finalFare     = Math.max(0, Math.round((originalFareInr - discountInr) * 100) / 100);
+    const discountInr = Math.round(maxAllowed * COIN_INR_VALUE * 100) / 100;
+    const finalFare   = Math.max(0, Math.round((originalFareInr - discountInr) * 100) / 100);
+    const tx = { type: 'coin_redeem', coins: -maxAllowed, discountInr, originalFare: originalFareInr, finalFare, createdAt: new Date().toISOString() };
+
+    if (USE_PG) {
+      const balances = await pgRepo.adjustAndRecord(userId, { coinDelta: -maxAllowed }, tx);
+      eventBus.publish('coins_redeemed', { userId, coinsRedeemed: maxAllowed, discountInr, finalFare });
+      logger.info('WALLET', `User ${userId} redeemed ${maxAllowed} coins → ₹${discountInr} off`);
+      return { success: true, coinsRedeemed: maxAllowed, discountInr, originalFare: originalFareInr, finalFare, coinBalanceAfter: balances.coinBalance };
+    }
 
     wallet.coinBalance -= maxAllowed;
-
-    const tx = {
-      txId: `TXN-REDEEM-${Date.now()}`,
-      type: 'coin_redeem',
-      coins: -maxAllowed,
-      discountInr,
-      originalFare: originalFareInr,
-      finalFare,
-      coinBalanceAfter: wallet.coinBalance,
-      cashBalanceAfter: wallet.cashBalance,
-      createdAt: new Date().toISOString(),
-    };
-    this._recordTx(wallet, tx);
-
+    const fullTx = { txId: `TXN-REDEEM-${Date.now()}`, ...tx, coinBalanceAfter: wallet.coinBalance, cashBalanceAfter: wallet.cashBalance };
+    this._recordTx(wallet, fullTx);
     eventBus.publish('coins_redeemed', { userId, coinsRedeemed: maxAllowed, discountInr, finalFare });
     logger.info('WALLET', `User ${userId} redeemed ${maxAllowed} coins → ₹${discountInr} off. Final fare: ₹${finalFare}`);
-
-    return {
-      success: true,
-      coinsRedeemed: maxAllowed,
-      discountInr,
-      originalFare: originalFareInr,
-      finalFare,
-      coinBalanceAfter: wallet.coinBalance,
-    };
+    return { success: true, coinsRedeemed: maxAllowed, discountInr, originalFare: originalFareInr, finalFare, coinBalanceAfter: wallet.coinBalance };
   }
 
   // ─── Topup cash wallet (rider recharges) ─────────────────────────────────
-  topupWallet(userId, amount, method = 'upi', referenceId = null) {
-    if (!amount || amount <= 0) {
-      return { success: false, error: 'Invalid topup amount.' };
-    }
-    if (amount > 50000) {
-      return { success: false, error: 'Max topup per transaction is ₹50,000.' };
+  async topupWallet(userId, amount, method = 'upi', referenceId = null) {
+    if (!amount || amount <= 0)  return { success: false, error: 'Invalid topup amount.' };
+    if (amount > 50000)          return { success: false, error: 'Max topup per transaction is ₹50,000.' };
+
+    const tx = { type: 'cash_topup', amountInr: amount, method, referenceId, createdAt: new Date().toISOString() };
+
+    if (USE_PG) {
+      await pgRepo._ensureWallet(userId);
+      const balances = await pgRepo.adjustAndRecord(userId, { cashDelta: amount }, tx);
+      eventBus.publish('wallet_topup', { userId, amount, method, cashBalance: balances.cashBalance });
+      logger.info('WALLET', `User ${userId} topped up ₹${amount} via ${method}`);
+      return { success: true, transaction: { txId: `TXN-TOPUP-${Date.now()}`, ...tx }, cashBalance: balances.cashBalance };
     }
 
     const wallet = this._getWallet(userId);
     wallet.cashBalance = Math.round((wallet.cashBalance + amount) * 100) / 100;
-
-    const tx = {
-      txId: `TXN-TOPUP-${Date.now()}`,
-      type: 'cash_topup',
-      amountInr: amount,
-      method,           // upi, card, netbanking, cash
-      referenceId,
-      coinBalanceAfter: wallet.coinBalance,
-      cashBalanceAfter: wallet.cashBalance,
-      createdAt: new Date().toISOString(),
-    };
-    this._recordTx(wallet, tx);
-
+    const fullTx = { txId: `TXN-TOPUP-${Date.now()}`, ...tx, coinBalanceAfter: wallet.coinBalance, cashBalanceAfter: wallet.cashBalance };
+    this._recordTx(wallet, fullTx);
     eventBus.publish('wallet_topup', { userId, amount, method, cashBalance: wallet.cashBalance });
     logger.info('WALLET', `User ${userId} topped up ₹${amount} via ${method}. Cash balance: ₹${wallet.cashBalance}`);
-
-    return {
-      success: true,
-      transaction: tx,
-      cashBalance: wallet.cashBalance,
-    };
+    return { success: true, transaction: fullTx, cashBalance: wallet.cashBalance };
   }
 
   // ─── Pay for ride using cash wallet ──────────────────────────────────────
-  payWithWallet(userId, fareInr, rideId) {
-    if (!fareInr || fareInr <= 0) {
-      return { success: false, error: 'Invalid fare amount.' };
+  async payWithWallet(userId, fareInr, rideId) {
+    if (!fareInr || fareInr <= 0) return { success: false, error: 'Invalid fare amount.' };
+
+    if (USE_PG) {
+      const bal = await this.getBalance(userId);
+      if (bal.cashBalance < fareInr) {
+        return { success: false, error: 'Insufficient wallet balance.', cashBalance: bal.cashBalance, required: fareInr, shortfall: Math.round((fareInr - bal.cashBalance) * 100) / 100 };
+      }
+      const tx = { type: 'ride_payment', amountInr: fareInr, rideId, createdAt: new Date().toISOString() };
+      const balances = await pgRepo.adjustAndRecord(userId, { cashDelta: -fareInr }, tx);
+      eventBus.publish('wallet_payment', { userId, fareInr, rideId, cashBalance: balances.cashBalance });
+      logger.info('WALLET', `User ${userId} paid ₹${fareInr} for ride ${rideId}`);
+      return { success: true, transaction: { txId: `TXN-PAY-${Date.now()}`, ...tx }, cashBalance: balances.cashBalance, amountPaid: fareInr };
     }
 
     const wallet = this._getWallet(userId);
-
     if (wallet.cashBalance < fareInr) {
-      return {
-        success: false,
-        error: 'Insufficient wallet balance.',
-        cashBalance: wallet.cashBalance,
-        required: fareInr,
-        shortfall: Math.round((fareInr - wallet.cashBalance) * 100) / 100,
-      };
+      return { success: false, error: 'Insufficient wallet balance.', cashBalance: wallet.cashBalance, required: fareInr, shortfall: Math.round((fareInr - wallet.cashBalance) * 100) / 100 };
     }
-
     wallet.cashBalance = Math.round((wallet.cashBalance - fareInr) * 100) / 100;
-
-    const tx = {
-      txId: `TXN-PAY-${Date.now()}`,
-      type: 'ride_payment',
-      amountInr: fareInr,
-      rideId,
-      coinBalanceAfter: wallet.coinBalance,
-      cashBalanceAfter: wallet.cashBalance,
-      createdAt: new Date().toISOString(),
-    };
-    this._recordTx(wallet, tx);
-
+    const fullTx = { txId: `TXN-PAY-${Date.now()}`, type: 'ride_payment', amountInr: fareInr, rideId, coinBalanceAfter: wallet.coinBalance, cashBalanceAfter: wallet.cashBalance, createdAt: new Date().toISOString() };
+    this._recordTx(wallet, fullTx);
     eventBus.publish('wallet_payment', { userId, fareInr, rideId, cashBalance: wallet.cashBalance });
     logger.info('WALLET', `User ${userId} paid ₹${fareInr} for ride ${rideId} via wallet. Cash balance: ₹${wallet.cashBalance}`);
-
-    return {
-      success: true,
-      transaction: tx,
-      cashBalance: wallet.cashBalance,
-      amountPaid: fareInr,
-    };
+    return { success: true, transaction: fullTx, cashBalance: wallet.cashBalance, amountPaid: fareInr };
   }
 
   // ─── Refund to cash wallet ────────────────────────────────────────────────
-  refundToWallet(userId, amount, rideId, reason = 'ride_cancelled') {
+  async refundToWallet(userId, amount, rideId, reason = 'ride_cancelled') {
     if (!amount || amount <= 0) return { success: false, error: 'Invalid refund amount.' };
+
+    const tx = { type: 'refund', amountInr: amount, rideId, reason, createdAt: new Date().toISOString() };
+
+    if (USE_PG) {
+      await pgRepo._ensureWallet(userId);
+      const balances = await pgRepo.adjustAndRecord(userId, { cashDelta: amount }, tx);
+      eventBus.publish('wallet_refund', { userId, amount, rideId, reason });
+      logger.info('WALLET', `Refunded ₹${amount} to user ${userId} wallet (${reason})`);
+      return { success: true, transaction: { txId: `TXN-REFUND-${Date.now()}`, ...tx }, cashBalance: balances.cashBalance };
+    }
 
     const wallet = this._getWallet(userId);
     wallet.cashBalance = Math.round((wallet.cashBalance + amount) * 100) / 100;
-
-    const tx = {
-      txId: `TXN-REFUND-${Date.now()}`,
-      type: 'refund',
-      amountInr: amount,
-      rideId,
-      reason,
-      coinBalanceAfter: wallet.coinBalance,
-      cashBalanceAfter: wallet.cashBalance,
-      createdAt: new Date().toISOString(),
-    };
-    this._recordTx(wallet, tx);
-
+    const fullTx = { txId: `TXN-REFUND-${Date.now()}`, ...tx, coinBalanceAfter: wallet.coinBalance, cashBalanceAfter: wallet.cashBalance };
+    this._recordTx(wallet, fullTx);
     eventBus.publish('wallet_refund', { userId, amount, rideId, reason });
     logger.info('WALLET', `Refunded ₹${amount} to user ${userId} wallet (${reason}). Cash balance: ₹${wallet.cashBalance}`);
-
-    return { success: true, transaction: tx, cashBalance: wallet.cashBalance };
+    return { success: true, transaction: fullTx, cashBalance: wallet.cashBalance };
   }
 
   // ─── Admin: credit/debit coins manually ──────────────────────────────────
@@ -281,31 +249,20 @@ class WalletService {
     return { success: true, transaction: tx, cashBalance: wallet.cashBalance };
   }
 
-  getTransactions(userId, limit = 20) {
+  async getTransactions(userId, limit = 20) {
+    if (USE_PG) {
+      const rows = await pgRepo.getTransactions(userId, limit);
+      return { userId, transactions: rows };
+    }
     const wallet = this._getWallet(userId);
-    return {
-      userId,
-      coinBalance: wallet.coinBalance,
-      cashBalance: wallet.cashBalance,
-      transactions: wallet.transactions.slice(-limit).reverse(),
-    };
+    return { userId, coinBalance: wallet.coinBalance, cashBalance: wallet.cashBalance, transactions: wallet.transactions.slice(-limit).reverse() };
   }
 
-  getStats() {
-    let totalCoins = 0;
-    let totalCash = 0;
-    let totalUsers = 0;
-    this.wallets.forEach(w => {
-      totalCoins += w.coinBalance;
-      totalCash += w.cashBalance;
-      totalUsers++;
-    });
-    return {
-      totalUsers,
-      totalCoinsInCirculation: totalCoins,
-      totalCashInWallets: Math.round(totalCash * 100) / 100,
-      coinInrValue: COIN_INR_VALUE,
-    };
+  async getStats() {
+    if (USE_PG) return pgRepo.getStats();
+    let totalCoins = 0, totalCash = 0, totalUsers = 0;
+    this.wallets.forEach(w => { totalCoins += w.coinBalance; totalCash += w.cashBalance; totalUsers++; });
+    return { totalUsers, totalCoinsInCirculation: totalCoins, totalCashInWallets: Math.round(totalCash * 100) / 100, coinInrValue: COIN_INR_VALUE };
   }
 }
 
