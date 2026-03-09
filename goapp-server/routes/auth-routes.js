@@ -89,6 +89,7 @@ function registerAuthRoutes(router, ctx) {
         data: {
           type: 'WELCOME_NEW_USER',
           route: 'profile_setup',
+          deepLink: 'goapp://profile/setup',
           userStatus: 'new',
           channelId: 'goapp_auth',
         },
@@ -103,6 +104,7 @@ function registerAuthRoutes(router, ctx) {
       data: {
         type: 'WELCOME_BACK_USER',
         route: 'home',
+        deepLink: 'goapp://home',
         userStatus: 'existing',
         name: displayName,
         channelId: 'goapp_auth',
@@ -398,6 +400,27 @@ function registerAuthRoutes(router, ctx) {
       ipAddress: ip || null,
       userAgent: headers?.['user-agent'] || null,
     });
+
+    if (result.success) {
+      const userId = result.user?.userId || result.user?.id || null;
+      if (userId) {
+        const profileComplete = await repositories.identity
+          .isProfileComplete(userId)
+          .catch(() => false);
+        const profile = await repositories.identity
+          .getUserProfile(userId)
+          .catch(() => null);
+        const profileName = profile?.name || result.user?.name || '';
+
+        await sendLoginWelcomeNotification({
+          userId,
+          isNewUser: result.isNewUser || false,
+          profileComplete,
+          profileName,
+        }).catch(() => {});
+      }
+    }
+
     return { status: result.success ? 200 : 400, data: result };
   };
 

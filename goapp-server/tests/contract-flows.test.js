@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { startAPIServer, bootstrapTestData } = require('../server');
+const { startAPIServer } = require('../server');
 const identityService = require('../services/identity-service');
 const matchingEngine = require('../services/matching-engine');
 const locationService = require('../services/location-service');
@@ -42,7 +42,6 @@ async function createSessionToken(phoneNumber) {
 }
 
 test.before(async () => {
-  bootstrapTestData();
   matchingEngine.registerDriver({
     driverId: 'DRV-CONTRACT-1',
     name: 'Contract Driver',

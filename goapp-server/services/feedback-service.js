@@ -90,10 +90,9 @@ class FeedbackService {
     const riderHistory = this.riderFeedbacks.get(riderId);
     riderHistory.push(entry);
 
-    // Recompute rider rating and apply live update
+    // Recompute rider rating and emit update event for persistence handlers.
     const newRating = this._computeRollingRating(riderHistory, null);
-    const mockDb = require('./mock-db');
-    mockDb.updateRiderRating(riderId, newRating);
+    eventBus.publish('rider_rating_updated', { riderId, rating: newRating });
 
     logger.info('FEEDBACK', `Driver ${driverId} rated Rider ${riderId}: ${rating}/5 for ride ${rideId}`);
     eventBus.publish('driver_rated_rider', { rideId, driverId, riderId, rating });

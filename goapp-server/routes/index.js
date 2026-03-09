@@ -3,6 +3,7 @@ const registerSystemRoutes = require('./system-routes');
 const registerAuthRoutes = require('./auth-routes');
 const registerRideRoutes = require('./ride-routes');
 const registerWalletRoutes = require('./wallet-routes');
+const registerCoinsRoutes = require('./coins-routes');
 const registerFeedbackRoutes = require('./feedback-routes');
 const registerPaymentRoutes = require('./payment-routes');
 const registerDriverDocumentRoutes = require('./driver-document-routes');
@@ -16,6 +17,10 @@ const registerIncentiveRoutes = require('./incentive-routes');
 const registerDemandRoutes = require('./demand-routes');
 const registerAdminSupportRoutes = require('./admin-support-routes');
 const registerRecoveryRoutes = require('./recovery-routes');
+const registerAdminVehicleRoutes = require('./admin-vehicle-routes');
+const registerSavedLocationsRoutes   = require('./saved-locations-routes');
+const registerZoneRestrictionRoutes  = require('./zone-restriction-routes');
+const registerZoneAnalyticsRoutes = require('./zone-analytics-routes');
 
 function buildRouteDispatcher(context) {
   const router = new SimpleRouter();
@@ -27,6 +32,7 @@ function buildRouteDispatcher(context) {
   registerDriverRoutes(router, context);
   registerTicketRoutes(router, context);
   registerRideRoutes(router, context);
+  registerCoinsRoutes(router, context);
   registerWalletRoutes(router, context);
   registerFeedbackRoutes(router, context);
   registerPaymentRoutes(router, context);
@@ -36,6 +42,10 @@ function buildRouteDispatcher(context) {
   registerDemandRoutes(router, context);
   registerAdminSupportRoutes(router, context);
   registerRecoveryRoutes(router, context);
+  registerAdminVehicleRoutes(router, context);
+  registerSavedLocationsRoutes(router, context);
+  registerZoneRestrictionRoutes(router, context);
+  registerZoneAnalyticsRoutes(router, context);
 
   return async (method, path, body, params, headers, files, ip) => {
     const routed = await router.dispatch({ method, path, body, params, headers, files, ip });

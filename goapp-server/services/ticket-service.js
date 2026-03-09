@@ -13,6 +13,7 @@
 //   system — automated messages (e.g., "Your ticket has been assigned")
 
 const { logger, eventBus } = require('../utils/logger');
+const notificationService = require('./notification-service');
 
 const TICKET_CATEGORIES = [
   'payment_issue',
@@ -133,6 +134,11 @@ class TicketService {
     }
 
     eventBus.publish('ticket_created', { ticketId, userId, userType, category, priority });
+    notificationService.notifyTicketCreated(userId, {
+      ticketId,
+      category,
+      priority,
+    }).catch(() => {});
     logger.info('TICKET', `Ticket ${ticketId} created by ${userType} ${userId} [${category}] [${priority}]`);
 
     return { success: true, ticket };
@@ -179,6 +185,12 @@ class TicketService {
       senderId,
       senderRole,
     });
+    if (senderRole === 'agent') {
+      notificationService.notifyTicketMessage(ticket.userId, {
+        ticketId,
+        senderRole,
+      }).catch(() => {});
+    }
 
     return { success: true, message, ticket: { ticketId, status: ticket.status } };
   }
@@ -227,6 +239,10 @@ class TicketService {
     }
 
     eventBus.publish('ticket_status_updated', { ticketId, prevStatus, newStatus: status });
+    notificationService.notifyTicketUpdated(ticket.userId, {
+      ticketId,
+      status,
+    }).catch(() => {});
     logger.info('TICKET', `Ticket ${ticketId} status: ${prevStatus} → ${status}`);
 
     return { success: true, ticket };
@@ -254,6 +270,10 @@ class TicketService {
       readAt: ticket.updatedAt,
     };
     ticket.messages.push(msg);
+    notificationService.notifyTicketUpdated(ticket.userId, {
+      ticketId,
+      status: ticket.status,
+    }).catch(() => {});
 
     return { success: true, ticket };
   }

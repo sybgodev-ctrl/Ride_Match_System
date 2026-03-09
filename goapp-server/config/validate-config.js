@@ -5,6 +5,7 @@ function validateConfig({ strict = false } = {}) {
   const warnings = [];
   const nodeEnv = process.env.NODE_ENV || 'development';
   const isDevelopment = nodeEnv === 'development';
+  const isTest = nodeEnv === 'test';
 
   if (!config.admin.token || config.admin.token === 'goapp-admin-secret') {
     const msg = 'GOAPP_ADMIN_TOKEN is using default value.';
@@ -61,7 +62,7 @@ function validateConfig({ strict = false } = {}) {
   }
 
   // ─── Database validation ────────────────────────────────────────────────────
-  const needsRealServices = !isDevelopment;
+  const needsRealServices = !isDevelopment && !isTest;
 
   if (needsRealServices && config.db.backend !== 'pg') {
     errors.push(`DB_BACKEND must be 'pg' in ${nodeEnv} environment (got '${config.db.backend}').`);
@@ -86,6 +87,20 @@ function validateConfig({ strict = false } = {}) {
 
   if (config.redis.backend === 'real' && !config.redis.host) {
     errors.push('REDIS_HOST is required when REDIS_BACKEND=real.');
+  }
+
+  if (!isTest && config.kafka.backend !== 'real') {
+    const msg = `KAFKA_BACKEND should be 'real' in ${nodeEnv} environment (got '${config.kafka.backend}').`;
+    if (strict || !isDevelopment) errors.push(msg); else warnings.push(msg);
+  }
+
+  if (!isTest && config.db.backend === 'mock') {
+    const msg = 'DB_BACKEND=mock is deprecated outside test.';
+    if (strict || !isDevelopment) errors.push(msg); else warnings.push(msg);
+  }
+  if (!isTest && config.redis.backend === 'mock') {
+    const msg = 'REDIS_BACKEND=mock is deprecated outside test.';
+    if (strict || !isDevelopment) errors.push(msg); else warnings.push(msg);
   }
 
   return { ok: errors.length === 0, errors, warnings, profile: nodeEnv };

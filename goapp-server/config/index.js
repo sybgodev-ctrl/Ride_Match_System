@@ -196,10 +196,9 @@ module.exports = {
   },
 
   // ─── Database ──────────────────────────────────────────────────────────────
-  // DB_BACKEND=mock  → in-memory MockDb (default — zero setup for development)
-  // DB_BACKEND=pg    → real PostgreSQL via pg.Pool (required for test/production)
+  // Always uses real PostgreSQL via pg.Pool
   db: {
-    backend:  process.env.DB_BACKEND        || (IS_DEVELOPMENT ? 'mock' : 'pg'),
+    backend:  'pg',
     host:     process.env.POSTGRES_HOST     || 'localhost',
     port:     parseInt(process.env.POSTGRES_PORT || '5432', 10),
     user:     process.env.POSTGRES_USER     || 'goapp',
@@ -222,22 +221,28 @@ module.exports = {
   },
 
   // ─── Redis ─────────────────────────────────────────────────────────────────
-  // REDIS_BACKEND=mock  → in-memory RedisMock (default — zero setup for development)
-  // REDIS_BACKEND=real  → real Redis client (required for test/production)
+  // Always uses real Redis
   redis: {
-    backend: process.env.REDIS_BACKEND || (IS_DEVELOPMENT ? 'mock' : 'real'),
+    backend: 'real',
     host:    process.env.REDIS_HOST    || 'localhost',
     port:    parseInt(process.env.REDIS_PORT || '6379', 10),
   },
 
   // ─── Kafka ─────────────────────────────────────────────────────────────────
-  // KAFKA_BACKEND=mock  → in-memory EventEmitter bus (default — zero setup)
-  // KAFKA_BACKEND=real  → real Apache Kafka via kafkajs (requires npm install kafkajs)
+  // Always uses real Apache Kafka via kafkajs
   kafka: {
-    backend:  process.env.KAFKA_BACKEND  || 'mock',
+    backend:  'real',
     clientId: process.env.KAFKA_CLIENT_ID || 'goapp-server',
     brokers: (process.env.KAFKA_BROKERS  || 'localhost:9092').split(',').map(b => b.trim()),
     // Consumer group prefix for multi-instance deployments
     groupPrefix: process.env.KAFKA_GROUP_PREFIX || 'goapp',
+  },
+
+  // Runtime cutover controls. Defaults are hard-on for non-test flows.
+  cutover: {
+    realRideFlowEnabled: process.env.REAL_RIDE_FLOW_ENABLED !== 'false',
+    realWsTrackingEnabled: process.env.REAL_WS_TRACKING_ENABLED !== 'false',
+    realPaymentWalletEnabled: process.env.REAL_PAYMENT_WALLET_ENABLED !== 'false',
+    realHistoryEnabled: process.env.REAL_HISTORY_ENABLED !== 'false',
   },
 };

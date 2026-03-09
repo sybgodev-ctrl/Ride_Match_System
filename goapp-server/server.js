@@ -16,6 +16,7 @@ const pricingService = require('./services/pricing-service');
 const rideService = require('./services/ride-service');
 const identityService = require('./services/identity-service');
 const walletService = require('./services/wallet-service');
+const coinsService = require('./services/coins-service');
 const driverWalletService = require('./services/driver-wallet-service');
 const feedbackService = require('./services/feedback-service');
 const perfMonitor = require('./services/perf-monitor');
@@ -28,7 +29,6 @@ const sosService = require('./services/sos-service');
 const smsService = require('./services/sms-service');
 const redis = require('./services/redis-client');
 const razorpayService = require('./services/razorpay-service');
-const mockDb = require('./services/mock-db');
 const zoneService = require('./services/zone-service');
 const notificationService = require('./services/notification-service');
 const WebSocketServer = require('./websocket/ws-gateway');
@@ -37,6 +37,9 @@ const googleMapsService = require('./services/google-maps-service');
 const db = require('./services/db');
 const profileService = require('./services/profile-service');
 const safetyService = require('./services/safety-service');
+const zoneCatalogService = require('./services/zone-catalog-service');
+const zoneMappingService = require('./services/zone-mapping-service');
+const zoneMetricsService = require('./services/zone-metrics-service');
 const { applySecurityHeaders, parseJsonBody, readRawBody } = require('./middleware/http-middleware');
 const { parseMultipart } = require('./middleware/multipart-parser');
 const DocumentStorageService = require('./services/document-storage-service');
@@ -83,9 +86,6 @@ function clampFloat(value, min, max, fallback) {
   const n = parseFloat(value);
   return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : fallback;
 }
-
-// Test Data
-const { generateIdentityUsers } = require('./data/test-data');
 
 // ─── Admin auth helper ────────────────────────────────────────────────────
 function requireAdmin(headers) {
@@ -179,7 +179,6 @@ function startAPIServer(port) {
     requireAdmin,
     services: {
       redis,
-      mockDb,
       locationService,
       pricingService,
       rideService,
@@ -187,9 +186,11 @@ function startAPIServer(port) {
       zoneService,
       demandLogService,
       walletService,
+      coinsService,
       driverWalletService,
       feedbackService,
       ticketService,
+      rideSessionService,
       sosService,
       matchingEngine,
       perfMonitor,
@@ -198,6 +199,9 @@ function startAPIServer(port) {
       notificationService,
       profileService,
       safetyService,
+      zoneCatalogService,
+      zoneMappingService,
+      zoneMetricsService,
       googleMapsService,
       smsService,
     },
@@ -482,33 +486,6 @@ function startAPIServer(port) {
   return server;
 }
 
-function bootstrapTestData() {
-  const batchSize = Math.min(enterpriseConfig.performance.bootstrapBatchSize || 250, 1000);
-  const seedResult = mockDb.seed({
-    driverCount: batchSize,
-    riderCount: 200,
-  });
-
-  for (const driver of seedResult.drivers) {
-    matchingEngine.registerDriver(driver);
-    locationService.updateLocation(driver.driverId, {
-      lat: driver.lat,
-      lng: driver.lng,
-      speed: driver.speed,
-      heading: driver.heading,
-    });
-  }
-
-  const identityUsers = generateIdentityUsers(300);
-  identityService.seedUsers(identityUsers);
-
-  logger.success('BOOTSTRAP', 'Seeded test datasets (no real DB dependency).', {
-    drivers: seedResult.driverCount,
-    riders: seedResult.riderCount,
-    identityUsers: identityUsers.length,
-  });
-}
-
 async function assertPgSchemaReady() {
   if (config.db.backend !== 'pg') return;
 
@@ -553,64 +530,57 @@ async function main() {
   await assertPgSchemaReady();
 
   const args = process.argv.slice(2);
-  const simOnly = args.includes('--sim-only');
   const apiOnly = args.includes('--api-only');
 
   console.clear();
   console.log('');
   console.log('  ╔══════════════════════════════════════════════════════╗');
-  console.log('  ║   GoApp Ride Matching Platform v2.1                 ║');
-  console.log('  ║   Microservice-ready + AWS-aware + Mock Data        ║');
+  console.log('  ║   GoApp Ride Matching Platform v2.2                 ║');
+  console.log('  ║   Microservice-ready + AWS-aware + Real Flow        ║');
   console.log('  ╚══════════════════════════════════════════════════════╝');
   console.log('');
 
-  bootstrapTestData();
-
-  let apiServer = null;
-  if (!simOnly) {
-    apiServer = startAPIServer(config.server.port);
-
-    const wsServer = new WebSocketServer({
-      authTimeoutMs: config.security.wsAuthTimeoutMs,
-      authenticateToken: async (token) => {
-        const payload = tokenService.verifyAccessToken(token);
-        if (!payload?.sessionToken) return null;
-        const session = await identityService.validateSession(payload.sessionToken);
-        if (!session) return null;
-        if (String(session.userId) !== String(payload.userId)) return null;
-        return { userId: session.userId, sessionToken: session.sessionToken };
-      },
-      canAccessRide: (userId, rideId) => {
-        const ride = rideService.getRide(rideId);
-        if (!ride) return false;
-        return String(ride.riderId) === String(userId) || String(ride.driverId) === String(userId);
-      },
-    });
-    wsServer.start(config.server.wsPort);
-    if (wsServer.server && typeof wsServer.server.on === 'function') {
-      wsServer.server.on('error', (err) => logger.error('WS', `WebSocket server error: ${err.message}`));
-    }
-    wsServer.onLocationUpdate = (driverId, data) => {
-      locationService.updateLocation(driverId, data);
-    };
+  const runtimeIsTest = (process.env.NODE_ENV || 'development') === 'test';
+  if (!runtimeIsTest && config.db.backend !== 'pg') {
+    throw new Error(`DB_BACKEND must be 'pg' for runtime flow (got '${config.db.backend}').`);
+  }
+  if (!runtimeIsTest && config.redis.backend !== 'real') {
+    throw new Error(`REDIS_BACKEND must be 'real' for runtime flow (got '${config.redis.backend}').`);
   }
 
+  const apiServer = startAPIServer(config.server.port);
+
+  const wsServer = new WebSocketServer({
+    authTimeoutMs: config.security.wsAuthTimeoutMs,
+    authenticateToken: async (token) => {
+      const payload = tokenService.verifyAccessToken(token);
+      if (!payload?.sessionToken) return null;
+      const session = await identityService.validateSession(payload.sessionToken);
+      if (!session) return null;
+      if (String(session.userId) !== String(payload.userId)) return null;
+      return { userId: session.userId, sessionToken: session.sessionToken };
+    },
+    canAccessRide: (userId, rideId) => {
+      const ride = rideService.getRide(rideId);
+      if (!ride) return false;
+      return String(ride.riderId) === String(userId) || String(ride.driverId) === String(userId);
+    },
+  });
+  wsServer.start(config.server.wsPort);
+  if (wsServer.server && typeof wsServer.server.on === 'function') {
+    wsServer.server.on('error', (err) => logger.error('WS', `WebSocket server error: ${err.message}`));
+  }
+  wsServer.onLocationUpdate = (driverId, data) => {
+    locationService.updateLocation(driverId, data);
+  };
   if (!apiOnly) {
-    const Simulator = require('./simulation/simulator');
-    const sim = new Simulator();
-    try {
-      await sim.run();
-    } catch (err) {
-      logger.error('SIM', `Simulator crashed: ${err.message}. API server remains up.`);
-    }
+    logger.info('BOOT', 'API and WebSocket started in real-flow mode.');
   }
 
-  if (!simOnly) {
-    console.log('\n  Servers are running. Press Ctrl+C to stop.\n');
-    console.log('  curl http://localhost:3000/api/v1/health');
-    console.log('  curl http://localhost:3000/api/v1/microservices');
-    console.log("  curl -X POST http://localhost:3000/api/v1/auth/otp/request -H 'Content-Type: application/json' -d '{\"phoneNumber\":\"+919876543210\",\"otpType\":\"login\"}'");
-  }
+  console.log('\n  Servers are running. Press Ctrl+C to stop.\n');
+  console.log('  curl http://localhost:3000/api/v1/health');
+  console.log('  curl http://localhost:3000/api/v1/microservices');
+  console.log("  curl -X POST http://localhost:3000/api/v1/auth/otp/request -H 'Content-Type: application/json' -d '{\"phoneNumber\":\"+919876543210\",\"otpType\":\"login\"}'");
 }
 
 if (require.main === module) {
@@ -623,6 +593,5 @@ if (require.main === module) {
 
 module.exports = {
   startAPIServer,
-  bootstrapTestData,
   main,
 };

@@ -353,11 +353,6 @@ class WebSocketServer {
 
   _normalizeChannelName(channel) {
     const raw = String(channel || '').trim();
-    if (raw.startsWith('ride:')) {
-      const migrated = `ride_${raw.slice('ride:'.length)}`;
-      logger.warn('WS-GATEWAY', `Legacy WS channel "${raw}" normalized to "${migrated}"`);
-      return migrated;
-    }
     return raw;
   }
 

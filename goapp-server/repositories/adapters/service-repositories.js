@@ -35,10 +35,17 @@ class ServiceMatchingStateRepository extends MatchingStateRepository {
 class ServiceWalletRepository extends WalletRepository {
   constructor(walletService) { super(); this.walletService = walletService; }
   getBalance(userId) { return this.walletService.getBalance(userId); }
-  payRide(userId, fareInr, rideId) { return this.walletService.payWithWallet(userId, fareInr, rideId); }
+  getCoinsBalance(userId) { return this.walletService.getCoinsBalance(userId); }
+  getCoinsHistory(userId, page, limit) { return this.walletService.getCoinsHistory(userId, page, limit); }
+  setCoinsAutoUse(userId, enabled) { return this.walletService.setCoinsAutoUse(userId, enabled); }
+  previewRideDiscount(userId, fareInr, options = {}) { return this.walletService.previewRideDiscount(userId, fareInr, options); }
+  payRide(userId, fareInr, rideId, paymentId = null, method = null) {
+    return this.walletService.payWithWallet(userId, fareInr, rideId, paymentId, method);
+  }
   refund(userId, amount, rideId, reason) { return this.walletService.refundToWallet(userId, amount, rideId, reason); }
   redeemCoins(userId, fareInr, coinsToUse) { return this.walletService.redeemCoins(userId, fareInr, coinsToUse); }
   getTransactions(userId, limit) { return this.walletService.getTransactions(userId, limit); }
+  getRidePaymentInfo(userId, rideId) { return this.walletService.getRidePaymentInfo(userId, rideId); }
 }
 
 module.exports = {

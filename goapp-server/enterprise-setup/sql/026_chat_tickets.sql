@@ -19,6 +19,13 @@ CREATE TABLE IF NOT EXISTS support_agents (
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Add columns that may be missing if table was created by an earlier migration
+ALTER TABLE support_agents ADD COLUMN IF NOT EXISTS is_online BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE support_agents ADD COLUMN IF NOT EXISTS max_tickets SMALLINT NOT NULL DEFAULT 10;
+ALTER TABLE support_agents ADD COLUMN IF NOT EXISTS current_tickets SMALLINT NOT NULL DEFAULT 0;
+ALTER TABLE support_agents ADD COLUMN IF NOT EXISTS total_resolved INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE support_agents ADD COLUMN IF NOT EXISTS avg_resolution_sec INTEGER;
+
 CREATE INDEX IF NOT EXISTS idx_agents_online ON support_agents(is_online) WHERE is_online = true;
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -53,6 +60,17 @@ CREATE TABLE IF NOT EXISTS support_tickets (
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Add columns that may be missing if table was created by an earlier migration
+ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS last_activity_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS escalated_at TIMESTAMPTZ;
+ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ;
+ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS resolved_by UUID REFERENCES support_agents(id);
+ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ;
+ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS tags TEXT[] DEFAULT '{}';
+ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS resolution TEXT;
+-- assigned_agent_id may not exist if an earlier migration used 'assigned_to' instead
+ALTER TABLE support_tickets ADD COLUMN IF NOT EXISTS assigned_agent_id UUID REFERENCES support_agents(id);
 
 CREATE INDEX IF NOT EXISTS idx_tickets_user     ON support_tickets(user_id, last_activity_at DESC);
 CREATE INDEX IF NOT EXISTS idx_tickets_status   ON support_tickets(status, priority, last_activity_at DESC);
