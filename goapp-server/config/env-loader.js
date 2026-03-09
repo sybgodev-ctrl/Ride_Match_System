@@ -32,7 +32,7 @@ if (!shouldLoadEnvFile) {
     console.error(`[env-loader] Copy .env.example to .env.${NODE_ENV} and fill in values.`);
     process.exit(1);
   }
-  console.warn(`[env-loader] WARNING: ${envFile} not found — booting with defaults (mock DB + mock Redis)`);
+  console.warn(`[env-loader] WARNING: ${envFile} not found — booting with process defaults.`);
 } else {
   loadEnvFile(envFile);
 }

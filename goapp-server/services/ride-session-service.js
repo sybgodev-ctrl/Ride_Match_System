@@ -20,7 +20,7 @@
 //   /restore, and navigates directly to the in-progress ride screen.
 
 const { logger, eventBus } = require('../utils/logger');
-const redis = require('./redis-mock');
+const redis = require('./redis-client');
 
 const HEARTBEAT_TTL_SEC = 120; // consider app "alive" if heartbeat within 2 min
 
@@ -111,8 +111,6 @@ class RideSessionService {
     const wsReconnectAction = {
       action:   'reconnect',
       rideId,
-      userId:   riderId,
-      userType: 'rider',
       channel:  wsChannel,
     };
 
@@ -168,7 +166,7 @@ class RideSessionService {
   }
 
   // ─── Heartbeat — rider app pings while active ────────────────────────────
-  heartbeat(riderId, rideId) {
+  async heartbeat(riderId, rideId) {
     const now = Date.now();
     const session = this.activeSessions.get(riderId);
 
@@ -183,9 +181,9 @@ class RideSessionService {
     }
 
     // Update Redis TTL so active-ride key stays alive
-    const cachedRideId = redis.get(`active_ride:${riderId}`);
+    const cachedRideId = await redis.get(`active_ride:${riderId}`);
     if (cachedRideId) {
-      redis.expire(`active_ride:${riderId}`, 4 * 3600);
+      await redis.expire(`active_ride:${riderId}`, 4 * 3600);
     }
 
     this._logRecovery({ type: 'heartbeat', riderId, rideId });

@@ -3,6 +3,9 @@
 const db = require('../../services/db');
 
 class PgSafetyRepository {
+  constructor() {
+    this._hasEmergencyDeletedAt = null;
+  }
 
   // ── Emergency Contacts ────────────────────────────────────────────────────
 
@@ -10,10 +13,11 @@ class PgSafetyRepository {
    * Returns all emergency contacts for a user, primary first then by name.
    */
   async getContacts(userId) {
+    const activeWhere = await this._activeContactWhere();
     const { rows } = await db.query(
       `SELECT id::text, contact_name, phone_number, is_primary
        FROM emergency_contacts
-       WHERE user_id = $1 AND deleted_at IS NULL
+       WHERE user_id = $1 AND ${activeWhere}
        ORDER BY is_primary DESC, contact_name ASC`,
       [userId]
     );
@@ -28,11 +32,12 @@ class PgSafetyRepository {
     const client = await db.getClient();
     try {
       await client.query('BEGIN');
+      const activeWhere = await this._activeContactWhere();
 
       // Enforce max 10 contacts
       const { rows: countRows } = await client.query(
         `SELECT COUNT(*)::int AS cnt FROM emergency_contacts
-         WHERE user_id = $1 AND deleted_at IS NULL`,
+         WHERE user_id = $1 AND ${activeWhere}`,
         [userId]
       );
       if (countRows[0].cnt >= 10) {
@@ -69,11 +74,12 @@ class PgSafetyRepository {
     const client = await db.getClient();
     try {
       await client.query('BEGIN');
+      const activeWhere = await this._activeContactWhere();
 
       // Verify ownership
       const { rows: ownerRows } = await client.query(
         `SELECT id, is_primary FROM emergency_contacts
-         WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+         WHERE id = $1 AND user_id = $2 AND ${activeWhere}`,
         [contactId, userId]
       );
       if (ownerRows.length === 0) {
@@ -84,10 +90,17 @@ class PgSafetyRepository {
 
       const wasPrimary = ownerRows[0].is_primary;
 
-      await client.query(
-        `UPDATE emergency_contacts SET deleted_at = NOW() WHERE id = $1`,
-        [contactId]
-      );
+      if (await this._hasDeletedAtColumn()) {
+        await client.query(
+          `UPDATE emergency_contacts SET deleted_at = NOW() WHERE id = $1`,
+          [contactId]
+        );
+      } else {
+        await client.query(
+          `DELETE FROM emergency_contacts WHERE id = $1`,
+          [contactId]
+        );
+      }
 
       // Promote oldest remaining contact to primary if needed
       if (wasPrimary) {
@@ -95,7 +108,7 @@ class PgSafetyRepository {
           `UPDATE emergency_contacts SET is_primary = true
            WHERE id = (
              SELECT id FROM emergency_contacts
-             WHERE user_id = $1 AND deleted_at IS NULL
+             WHERE user_id = $1 AND ${activeWhere}
              ORDER BY created_at ASC LIMIT 1
            )`,
           [userId]
@@ -118,11 +131,12 @@ class PgSafetyRepository {
     const client = await db.getClient();
     try {
       await client.query('BEGIN');
+      const activeWhere = await this._activeContactWhere();
 
       // Verify ownership
       const { rows } = await client.query(
         `SELECT id FROM emergency_contacts
-         WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
+         WHERE id = $1 AND user_id = $2 AND ${activeWhere}`,
         [contactId, userId]
       );
       if (rows.length === 0) {
@@ -134,7 +148,7 @@ class PgSafetyRepository {
       // Clear all primary flags for user
       await client.query(
         `UPDATE emergency_contacts SET is_primary = false
-         WHERE user_id = $1 AND deleted_at IS NULL`,
+         WHERE user_id = $1 AND ${activeWhere}`,
         [userId]
       );
 
@@ -157,10 +171,11 @@ class PgSafetyRepository {
    * Updates name and/or phone number of an existing contact.
    */
   async updateContact(userId, contactId, { name, phoneNumber }) {
+    const activeWhere = await this._activeContactWhere();
     const { rows } = await db.query(
       `UPDATE emergency_contacts
        SET contact_name = $3, phone_number = $4
-       WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+       WHERE id = $1 AND user_id = $2 AND ${activeWhere}
        RETURNING id::text, contact_name, phone_number, is_primary`,
       [contactId, userId, name, phoneNumber]
     );
@@ -180,10 +195,11 @@ class PgSafetyRepository {
     if (!phoneNumber || !phoneNumber.trim()) return;
     const phone = phoneNumber.trim();
 
+    const activeWhere = await this._activeContactWhere();
     // Skip if this number already exists (active contact)
     const { rows: existing } = await db.query(
       `SELECT id FROM emergency_contacts
-       WHERE user_id = $1 AND phone_number = $2 AND deleted_at IS NULL`,
+       WHERE user_id = $1 AND phone_number = $2 AND ${activeWhere}`,
       [userId, phone]
     );
     if (existing.length > 0) return;
@@ -234,6 +250,25 @@ class PgSafetyRepository {
       number:    row.phone_number,
       isPrimary: row.is_primary,
     };
+  }
+
+  async _hasDeletedAtColumn() {
+    if (this._hasEmergencyDeletedAt != null) return this._hasEmergencyDeletedAt;
+    const { rows } = await db.query(
+      `SELECT EXISTS (
+         SELECT 1
+         FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'emergency_contacts'
+           AND column_name = 'deleted_at'
+       ) AS "exists"`
+    );
+    this._hasEmergencyDeletedAt = Boolean(rows[0]?.exists);
+    return this._hasEmergencyDeletedAt;
+  }
+
+  async _activeContactWhere() {
+    return (await this._hasDeletedAtColumn()) ? 'deleted_at IS NULL' : 'TRUE';
   }
 }
 

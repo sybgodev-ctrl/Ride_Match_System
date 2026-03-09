@@ -179,7 +179,25 @@ class GoogleMapsService {
       this.stats.geocodeCalls += 1;
       const results = response.data.results;
       if (!results || results.length === 0) return { error: 'No results' };
-      return { formattedAddress: results[0].formatted_address };
+      const top = results[0];
+      const components = Array.isArray(top.address_components)
+        ? top.address_components
+        : [];
+      const getComponent = (types) => {
+        const found = components.find((c) =>
+          Array.isArray(c.types) && types.some((t) => c.types.includes(t)),
+        );
+        return found || null;
+      };
+      const countryComp = getComponent(['country']);
+      const stateComp = getComponent(['administrative_area_level_1']);
+      const pincodeComp = getComponent(['postal_code']);
+      return {
+        formattedAddress: top.formatted_address,
+        country: countryComp?.short_name || countryComp?.long_name || null,
+        state: stateComp?.short_name || stateComp?.long_name || null,
+        pincode: pincodeComp?.long_name || pincodeComp?.short_name || null,
+      };
     } catch (err) {
       logger.warn('MAPS', `Reverse Geocode error: ${err.message}`);
       return { error: err.message };

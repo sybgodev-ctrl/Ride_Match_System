@@ -81,7 +81,13 @@ function registerProfileRoutes(router, ctx) {
       notificationService.send(userId, {
         title: '🎉 100 Coins Added!',
         body: 'Your welcome bonus has been added to your wallet.',
-        data: { type: 'WELCOME_COINS', coins: '100', channelId: 'goapp_auth' },
+        data: {
+          type: 'WELCOME_COINS',
+          coins: '100',
+          route: 'home',
+          deepLink: 'goapp://wallet',
+          channelId: 'goapp_auth',
+        },
       }).catch(() => {});
     }
 

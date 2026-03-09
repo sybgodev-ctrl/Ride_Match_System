@@ -6,6 +6,7 @@
 
 const crypto = require('crypto');
 const { logger, eventBus } = require('../utils/logger');
+const notificationService = require('./notification-service');
 
 // SOS status machine
 const SOS_STATUS = {
@@ -90,6 +91,11 @@ class SosService {
       lat: sosRecord.location.lat,
       lng: sosRecord.location.lng,
     });
+    notificationService.notifySosTriggered(userId, {
+      sosId,
+      rideId,
+      sosType,
+    }).catch(() => {});
 
     logger.error('SOS', `🚨 SOS TRIGGERED: ${sosId} | User: ${userId} | Type: ${sosType} | Ride: ${rideId || 'N/A'}`);
 
@@ -127,6 +133,10 @@ class SosService {
     }
 
     eventBus.publish('sos_status_updated', { sosId, status, userId: sos.userId });
+    notificationService.notifySosStatusUpdated(sos.userId, {
+      sosId,
+      status,
+    }).catch(() => {});
     logger.info('SOS', `SOS ${sosId} status updated to ${status} by ${resolvedBy || 'admin'}`);
 
     return { success: true, sosId, status, updatedAt: new Date(now).toISOString() };

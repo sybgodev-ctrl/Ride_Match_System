@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
 # GoApp Enterprise Schema Migration Runner
-# Executes all 20 migration files in order (248 tables total)
+# Executes all numbered migration files in lexical order
 # ============================================================
 
 set -e
@@ -37,10 +37,10 @@ echo ""
 run_psql_file() {
     local sql_file="$1"
     if [ "$RUN_MODE" = "local_psql" ]; then
-        psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -f "$sql_file"
+        psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 -f "$sql_file"
     else
         docker compose -f "$SETUP_DIR/docker-compose.yml" exec -T postgres \
-            psql -U "$DB_USER" -d "$DB_NAME" -f "/docker-entrypoint-initdb.d/$(basename "$sql_file")"
+            psql -U "$DB_USER" -d "$DB_NAME" -v ON_ERROR_STOP=1 -f /dev/stdin < "$sql_file"
     fi
 }
 
@@ -55,7 +55,6 @@ run_psql_cmd() {
 }
 
 # Discover migration files dynamically and execute in lexical order.
-# Expected range: 001..029
 MIGRATIONS=()
 for f in "$SCRIPT_DIR"/[0-9][0-9][0-9]_*.sql; do
     [ -e "$f" ] || continue
@@ -70,8 +69,11 @@ fi
 IFS=$'\n' MIGRATIONS=($(printf "%s\n" "${MIGRATIONS[@]}" | sort))
 unset IFS
 
+MAX_PREFIX=$(printf "%s\n" "${MIGRATIONS[@]}" | sed -E 's/^([0-9]{3})_.*/\1/' | sort -n | tail -n 1)
+MAX_PREFIX_NUM=$((10#$MAX_PREFIX))
+
 MISSING_PREFIXES=()
-for n in $(seq 1 29); do
+for n in $(seq 1 "$MAX_PREFIX_NUM"); do
     prefix=$(printf "%03d" "$n")
     found=0
     for file in "${MIGRATIONS[@]}"; do

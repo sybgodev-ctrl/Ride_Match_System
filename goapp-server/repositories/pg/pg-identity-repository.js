@@ -12,6 +12,10 @@ const db = require('../../services/db');
 const OTP_WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 
 class PgIdentityRepository {
+  constructor() {
+    this._riderColumnCache = new Map();
+  }
+
   // ─── OTP Rate Limiting ────────────────────────────────────────────────────
 
   async getRateLimit(phone) {
@@ -483,17 +487,24 @@ class PgIdentityRepository {
         }
 
         if (fcmToken) {
-          await client.query(
-            `INSERT INTO push_tokens (user_id, device_id, platform, token, is_active, updated_at)
-             VALUES ($1, $2, $3, $4, true, NOW())
-             ON CONFLICT (token)
-             DO UPDATE SET user_id = EXCLUDED.user_id,
-                           device_id = EXCLUDED.device_id,
-                           platform = EXCLUDED.platform,
-                           is_active = true,
-                           updated_at = NOW()`,
+          const updateRes = await client.query(
+            `UPDATE push_tokens
+             SET user_id = $1,
+                 device_id = $2,
+                 platform = $3,
+                 is_active = true,
+                 updated_at = NOW()
+             WHERE token = $4`,
             [user.id, deviceRecord?.id || null, normalizedPlatform, fcmToken]
           );
+          if (updateRes.rowCount === 0) {
+            await client.query(
+              `INSERT INTO push_tokens (user_id, device_id, platform, token, is_active, updated_at)
+               SELECT $1, $2, $3, $4, true, NOW()
+               WHERE NOT EXISTS (SELECT 1 FROM push_tokens WHERE token = $4)`,
+              [user.id, deviceRecord?.id || null, normalizedPlatform, fcmToken]
+            );
+          }
         }
       }
 
@@ -942,12 +953,13 @@ class PgIdentityRepository {
   // ─── Welcome Bonus ────────────────────────────────────────────────────────
 
   async awardWelcomeBonus(userId) {
+    const hasWelcomeBonusClaimed = await this._hasRiderColumn('welcome_bonus_claimed');
     // Fast path: already claimed
-    const { rows: riderRows } = await db.query(
-      `SELECT id, welcome_bonus_claimed FROM riders WHERE user_id = $1 LIMIT 1`,
-      [userId]
-    );
-    if (!riderRows[0] || riderRows[0].welcome_bonus_claimed) {
+    const riderSelectSql = hasWelcomeBonusClaimed
+      ? `SELECT id, welcome_bonus_claimed FROM riders WHERE user_id = $1 LIMIT 1`
+      : `SELECT id, false AS welcome_bonus_claimed FROM riders WHERE user_id = $1 LIMIT 1`;
+    const { rows: riderRows } = await db.query(riderSelectSql, [userId]);
+    if (!riderRows[0] || Boolean(riderRows[0].welcome_bonus_claimed)) {
       return { coinsAwarded: 0, alreadyClaimed: true };
     }
 
@@ -967,14 +979,21 @@ class PgIdentityRepository {
       const balanceAfter  = balanceBefore + BONUS;
 
       // Record transaction — idempotency_key prevents any duplicate
-      await client.query(
+      const creditTx = await client.query(
         `INSERT INTO coin_transactions
            (wallet_id, user_id, transaction_type, coins, balance_before, balance_after,
             reference_type, description, idempotency_key)
          VALUES ($1, $2, 'credit', $3, $4, $5, 'signup', 'Welcome signup bonus', $6)
-         ON CONFLICT (idempotency_key) DO NOTHING`,
+         ON CONFLICT (idempotency_key) DO NOTHING
+         RETURNING id`,
         [wallet.id, userId, BONUS, balanceBefore, balanceAfter, `welcome_bonus:${userId}`]
       );
+
+      // Idempotency guard: if already awarded previously, do not mutate wallet again.
+      if (creditTx.rowCount === 0) {
+        await client.query('COMMIT');
+        return { coinsAwarded: 0, alreadyClaimed: true };
+      }
 
       // Update wallet balance
       await client.query(
@@ -984,11 +1003,13 @@ class PgIdentityRepository {
         [wallet.id, balanceAfter, BONUS]
       );
 
-      // Mark bonus claimed on rider
-      await client.query(
-        `UPDATE riders SET welcome_bonus_claimed = true WHERE id = $1`,
-        [riderId]
-      );
+      // Mark bonus claimed on rider if the column exists in this schema version.
+      if (hasWelcomeBonusClaimed) {
+        await client.query(
+          `UPDATE riders SET welcome_bonus_claimed = true WHERE id = $1`,
+          [riderId]
+        );
+      }
 
       await client.query('COMMIT');
       return { coinsAwarded: BONUS, alreadyClaimed: false };
@@ -1003,9 +1024,10 @@ class PgIdentityRepository {
   // ─── Referral Code ────────────────────────────────────────────────────────
 
   async generateOrGetReferralCode(userId) {
+    const hasRiderReferralCode = await this._hasRiderColumn('referral_code');
     // Return existing code if already created
     const { rows: riderRows } = await db.query(
-      `SELECT r.referral_code, up.display_name
+      `SELECT ${hasRiderReferralCode ? 'r.referral_code' : 'NULL::text AS referral_code'}, up.display_name
        FROM riders r
        LEFT JOIN user_profiles up ON up.user_id = r.user_id
        WHERE r.user_id = $1 LIMIT 1`,
@@ -1040,10 +1062,12 @@ class PgIdentityRepository {
               [userId, programId, code]
             );
           }
-          await client.query(
-            `UPDATE riders SET referral_code = $2 WHERE user_id = $1`,
-            [userId, code]
-          );
+          if (hasRiderReferralCode) {
+            await client.query(
+              `UPDATE riders SET referral_code = $2 WHERE user_id = $1`,
+              [userId, code]
+            );
+          }
           await client.query('COMMIT');
           return { code };
         } catch (err) {
@@ -1058,6 +1082,25 @@ class PgIdentityRepository {
       }
     }
     return { code: null };
+  }
+
+  async _hasRiderColumn(columnName) {
+    if (this._riderColumnCache.has(columnName)) {
+      return this._riderColumnCache.get(columnName);
+    }
+    const { rows } = await db.query(
+      `SELECT EXISTS (
+         SELECT 1
+         FROM information_schema.columns
+         WHERE table_schema = 'public'
+           AND table_name = 'riders'
+           AND column_name = $1
+       ) AS "exists"`,
+      [columnName]
+    );
+    const exists = Boolean(rows[0]?.exists);
+    this._riderColumnCache.set(columnName, exists);
+    return exists;
   }
 
   // ─── Stats ────────────────────────────────────────────────────────────────

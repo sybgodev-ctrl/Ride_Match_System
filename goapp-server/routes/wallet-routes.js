@@ -38,9 +38,17 @@ function registerWalletRoutes(router, ctx) {
     const parsed = validateSchema(body, [
       { key: 'fareInr', type: 'number', required: true, min: 0.01 },
       { key: 'rideId', type: 'string', required: false, maxLength: 255 },
+      { key: 'paymentId', type: 'string', required: false, maxLength: 255 },
+      { key: 'method', type: 'string', required: false, maxLength: 64 },
     ]);
     if (!parsed.ok) return { status: 400, data: { error: parsed.error } };
-    const result = await repositories.wallet.payRide(pathParams.userId, parsed.data.fareInr, parsed.data.rideId);
+    const result = await repositories.wallet.payRide(
+      pathParams.userId,
+      parsed.data.fareInr,
+      parsed.data.rideId,
+      parsed.data.paymentId,
+      parsed.data.method
+    );
     return { status: result.success ? 200 : 400, data: result };
   });
 

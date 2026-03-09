@@ -62,6 +62,18 @@ if (!/status:\s*404[\s\S]*code:\s*['"]NOT_FOUND['"]/.test(dispatcherContent)) {
   violations.push('routes/index.js must return standardized 404 envelope with NOT_FOUND code.');
 }
 
+const forbiddenRuntimeMockPatterns = [
+  /services\/mock-db/,
+  /simulation\/simulator/,
+  /--sim-only/,
+];
+
+for (const pattern of forbiddenRuntimeMockPatterns) {
+  if (pattern.test(serverContent)) {
+    violations.push(`server.js contains forbidden runtime mock/simulation reference (${pattern}).`);
+  }
+}
+
 if (violations.length > 0) {
   console.error('Architecture guard failed:\n');
   for (const v of violations) console.error(`- ${v}`);

@@ -1,8 +1,8 @@
 // GoApp Ride Service
 // Ride lifecycle state machine, idempotency, cancellation
 //
-// DB_BACKEND=mock  → rides stored in in-memory Map (zero setup)
-// DB_BACKEND=pg    → rides persisted to PostgreSQL via pg-ride-repository
+// Rides are persisted to PostgreSQL via pg-ride-repository.
+// this.rides is a hot-cache Map for fast in-flight lookups — NOT a mock.
 
 const crypto = require('crypto');
 const config = require('../config');
@@ -10,19 +10,19 @@ const redis = require('./redis-client');
 const matchingEngine = require('./matching-engine');
 const pricingService = require('./pricing-service');
 const notificationService = require('./notification-service');
+const zoneMappingService = require('./zone-mapping-service');
+const zoneMetricsService = require('./zone-metrics-service');
 const { haversine } = require('../utils/formulas');
 const { logger, eventBus } = require('../utils/logger');
 const driverWalletService = require('./driver-wallet-service');
 const rideSessionService  = require('./ride-session-service');
-
-const USE_PG = config.db.backend === 'pg';
-const pgRepo = USE_PG ? require('../repositories/pg/pg-ride-repository') : null;
+const pgRepo = require('../repositories/pg/pg-ride-repository');
 
 const S = config.rideStatuses;
 
 class RideService {
   constructor() {
-    this.rides              = new Map(); // rideId -> ride object (always maintained in-memory as hot cache)
+    this.rides              = new Map(); // rideId -> ride object (hot cache for active rides)
     this.cancellationCounts = new Map(); // `${type}:${userId}` -> { count, windowStart }
   }
 
@@ -40,19 +40,41 @@ class RideService {
     }
 
     // ─── Create Ride ───
-    const rideId = `RIDE-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
-    const now = Date.now();
+    const rideId   = `RIDE-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+    const dbRideId = crypto.randomUUID();
+    const now      = Date.now();
 
     // Get fare estimates (async: uses Google Maps road distance when configured)
     const estimates = await pricingService.getEstimates(pickupLat, pickupLng, destLat, destLng);
     const fareEstimate = estimates.estimates[rideType] || estimates.estimates.sedan;
+    let zoneMatch = {
+      pickupZoneId: null,
+      pickupZoneCode: null,
+      dropZoneId: null,
+      dropZoneCode: null,
+    };
+    try {
+      zoneMatch = await zoneMappingService.resolvePickupAndDrop(
+        pickupLat,
+        pickupLng,
+        destLat,
+        destLng,
+      );
+    } catch (err) {
+      logger.warn('ZONE_MAP', `Zone assignment unavailable for ride request: ${err.message}`);
+    }
 
     const ride = {
       rideId,
+      dbRideId,
       riderId,
       driverId: null,
       pickupLat, pickupLng,
       destLat, destLng,
+      pickupZoneId: zoneMatch.pickupZoneId,
+      pickupZoneCode: zoneMatch.pickupZoneCode,
+      dropZoneId: zoneMatch.dropZoneId,
+      dropZoneCode: zoneMatch.dropZoneCode,
       rideType: rideType || 'sedan',
       status: S.REQUESTED,
       fareEstimate,
@@ -70,19 +92,20 @@ class RideService {
 
     this.rides.set(rideId, ride);
 
-    // Persist to PostgreSQL (non-blocking — in-memory Map remains source of truth during the ride)
-    if (USE_PG) {
-      pgRepo.createRide({
-        rideId,
-        riderId,
-        rideType: rideType || 'sedan',
-        pickupLat, pickupLng,
-        destLat, destLng,
-        fareEstimate: fareEstimate.finalFare,
-        surgeMultiplier: estimates.surgeMultiplier,
-        idempotencyKey,
-      }).catch(err => logger.warn('RIDE', `pg createRide failed (non-fatal): ${err.message}`));
-    }
+    // Persist to PostgreSQL (non-blocking — hot-cache Map is source of truth during the ride)
+    pgRepo.createRide({
+      rideId: dbRideId,
+      rideNumber: rideId,
+      riderId,
+      rideType: rideType || 'sedan',
+      pickupLat, pickupLng,
+      destLat, destLng,
+      pickupZoneId: zoneMatch.pickupZoneId,
+      dropZoneId: zoneMatch.dropZoneId,
+      fareEstimate: fareEstimate.finalFare,
+      surgeMultiplier: estimates.surgeMultiplier,
+      idempotencyKey,
+    }).catch(err => logger.warn('RIDE', `pg createRide failed (non-fatal): ${err.message}`));
 
     // Index active ride in Redis for fast recovery lookup (4-hour TTL)
     if (riderId) redis.set(`active_ride:${riderId}`, rideId, 4 * 3600);
@@ -101,8 +124,15 @@ class RideService {
 
     eventBus.publish('ride_requested', {
       rideId, riderId, rideType, pickupLat, pickupLng, destLat, destLng,
+      pickupZoneId: ride.pickupZoneId,
+      dropZoneId: ride.dropZoneId,
       fareEstimate: fareEstimate.finalFare,
     });
+    zoneMetricsService.recordRequested({
+      zoneId: ride.pickupZoneId,
+      riderId: ride.riderId,
+      eventTime: new Date(now).toISOString(),
+    }).catch((err) => logger.warn('ZONE_METRICS', `recordRequested failed: ${err.message}`));
 
     // ─── Start Matching ───
     this._updateStatus(rideId, S.MATCHING);
@@ -111,7 +141,7 @@ class RideService {
     const matchResult = await matchingEngine.startMatching(ride);
 
     if (matchResult.success) {
-      ride.driverId = matchResult.driverId;
+      ride.driverId  = matchResult.driverId;
       ride.acceptedAt = Date.now();
       ride.matchResult = matchResult;
       this._updateStatus(rideId, S.ACCEPTED);
@@ -134,6 +164,8 @@ class RideService {
 
       return {
         rideId,
+        pickupZoneId: ride.pickupZoneId,
+        dropZoneId: ride.dropZoneId,
         status: S.DRIVER_ARRIVING,
         driver: {
           driverId: matchResult.driverId,
@@ -148,9 +180,16 @@ class RideService {
       };
     } else {
       this._updateStatus(rideId, S.NO_DRIVERS);
+      zoneMetricsService.recordNoDriver({
+        zoneId: ride.pickupZoneId,
+        riderId: ride.riderId,
+        eventTime: new Date().toISOString(),
+      }).catch((err) => logger.warn('ZONE_METRICS', `recordNoDriver failed: ${err.message}`));
       notificationService.notifyNoDrivers(riderId, rideId);
       return {
         rideId,
+        pickupZoneId: ride.pickupZoneId,
+        dropZoneId: ride.dropZoneId,
         status: S.NO_DRIVERS,
         message: matchResult.message,
         canRetry: matchResult.canRetry,
@@ -190,14 +229,14 @@ class RideService {
     return ride;
   }
 
-  completeTrip(rideId, actualDistanceKm, actualDurationMin) {
+  async completeTrip(rideId, actualDistanceKm, actualDurationMin) {
     const ride = this.rides.get(rideId);
     if (!ride || ride.status !== S.TRIP_STARTED) return null;
 
     ride.completedAt = Date.now();
 
     // Calculate final fare with actual distance/duration
-    const finalFare = pricingService.calculateFare(
+    const finalFare = await pricingService.calculateFare(
       ride.rideType,
       actualDistanceKm || ride.fareEstimate.distanceKm,
       actualDurationMin || ride.fareEstimate.durationMin,
@@ -206,8 +245,8 @@ class RideService {
     ride.finalFare = finalFare;
 
     this._updateStatus(rideId, S.TRIP_COMPLETED, {
-      completedAt:    ride.completedAt,
-      finalFare:      finalFare.finalFare,
+      completedAt:     ride.completedAt,
+      finalFare:       finalFare.finalFare,
       actualDistanceM: actualDistanceKm ? Math.round(actualDistanceKm * 1000) : null,
       actualDurationS: actualDurationMin ? Math.round(actualDurationMin * 60) : null,
     });
@@ -226,15 +265,31 @@ class RideService {
 
     eventBus.publish('ride_completed', {
       rideId, driverId: ride.driverId, riderId: ride.riderId,
+      pickupZoneId: ride.pickupZoneId,
+      dropZoneId: ride.dropZoneId,
       fare: finalFare.finalFare, driverEarnings: finalFare.driverEarnings,
     });
+    const waitSec = ride.acceptedAt
+      ? Math.max(0, Math.round((ride.acceptedAt - ride.createdAt) / 1000))
+      : null;
+    const tripSec = ride.startedAt
+      ? Math.max(0, Math.round((ride.completedAt - ride.startedAt) / 1000))
+      : null;
+    zoneMetricsService.recordCompleted({
+      zoneId: ride.pickupZoneId,
+      riderId: ride.riderId,
+      eventTime: new Date(ride.completedAt).toISOString(),
+      fareInr: finalFare.finalFare,
+      waitSec,
+      tripSec,
+    }).catch((err) => logger.warn('ZONE_METRICS', `recordCompleted failed: ${err.message}`));
 
     logger.divider(`RIDE COMPLETED: ${rideId}`);
     logger.success('RIDE', `Fare: ₹${finalFare.finalFare} | Driver: ₹${finalFare.driverEarnings} | Platform: ₹${finalFare.platformCommission}`);
 
     // Credit driver earnings and deduct platform commission
     if (ride.driverId) {
-      const platformFee = Math.round(finalFare.platformCommission * 100) / 100;
+      const platformFee    = Math.round(finalFare.platformCommission * 100) / 100;
       const driverEarnings = Math.round(finalFare.driverEarnings * 100) / 100;
       driverWalletService.deductCommission(ride.driverId, platformFee, rideId);
       driverWalletService.creditEarnings(ride.driverId, driverEarnings, rideId);
@@ -258,7 +313,7 @@ class RideService {
   }
 
   // ═══════════════════════════════════════════
-  // CANCELLATION (FIX #4)
+  // CANCELLATION
   // ═══════════════════════════════════════════
   cancelRide(rideId, cancelledBy, userId) {
     const ride = this.rides.get(rideId);
@@ -335,7 +390,7 @@ class RideService {
       this._updateStatus(rideId, S.MATCHING);
       matchingEngine.resumeMatching(ride, lastStage).then(matchResult => {
         if (matchResult.success) {
-          ride.driverId = matchResult.driverId;
+          ride.driverId  = matchResult.driverId;
           ride.acceptedAt = Date.now();
           ride.matchResult = matchResult;
           this._updateStatus(rideId, S.ACCEPTED);
@@ -351,17 +406,32 @@ class RideService {
           });
         } else {
           this._updateStatus(rideId, S.NO_DRIVERS);
+          zoneMetricsService.recordNoDriver({
+            zoneId: ride.pickupZoneId,
+            riderId: ride.riderId,
+            eventTime: new Date().toISOString(),
+          }).catch((err) => logger.warn('ZONE_METRICS', `recordNoDriver failed: ${err.message}`));
           notificationService.notifyNoDrivers(ride.riderId, rideId);
         }
       }).catch(err => {
         logger.error('RIDE', `Re-matching failed for ride ${rideId}: ${err.message}`);
         this._updateStatus(rideId, S.NO_DRIVERS);
+        zoneMetricsService.recordNoDriver({
+          zoneId: ride.pickupZoneId,
+          riderId: ride.riderId,
+          eventTime: new Date().toISOString(),
+        }).catch((e) => logger.warn('ZONE_METRICS', `recordNoDriver failed: ${e.message}`));
         notificationService.notifyNoDrivers(ride.riderId, rideId);
       });
     }
 
     ride.cancelledAt = now;
     ride.cancelledBy = cancelledBy;
+    zoneMetricsService.recordCancelled({
+      zoneId: ride.pickupZoneId,
+      riderId: ride.riderId,
+      eventTime: new Date(now).toISOString(),
+    }).catch((err) => logger.warn('ZONE_METRICS', `recordCancelled failed: ${err.message}`));
     if (ride.riderId) redis.del(`active_ride:${ride.riderId}`);
     rideSessionService.onRideEnded(ride.riderId);
 
@@ -434,10 +504,8 @@ class RideService {
     logger.info('RIDE', `Ride ${rideId}: ${prev} → ${newStatus}`);
 
     // Persist status change to PostgreSQL
-    if (USE_PG) {
-      pgRepo.updateStatus(rideId, newStatus, pgExtra)
-        .catch(err => logger.warn('RIDE', `pg updateStatus failed (non-fatal): ${err.message}`));
-    }
+    pgRepo.updateStatus(rideId, newStatus, pgExtra)
+      .catch(err => logger.warn('RIDE', `pg updateStatus failed (non-fatal): ${err.message}`));
   }
 
   // ─── Active ride lookup by riderId (for app session recovery) ───
@@ -453,7 +521,7 @@ class RideService {
       if (r && activeStatuses.has(r.status)) return r;
       redis.del('active_ride:' + riderId);
     }
-    // Fallback: linear scan
+    // Fallback: linear scan of hot-cache
     for (const ride of this.rides.values()) {
       if (ride.riderId === riderId && activeStatuses.has(ride.status)) return ride;
     }
@@ -461,45 +529,17 @@ class RideService {
   }
 
   getRide(rideId) {
-    // Hot cache first; fall back to DB
+    // Hot cache first; fall back to PG
     if (this.rides.has(rideId)) return this.rides.get(rideId);
-    if (USE_PG) return pgRepo.getRide(rideId);
-    return undefined;
+    return pgRepo.getRide(rideId);
   }
 
   getAllRides() {
-    if (USE_PG) return pgRepo.getAllRides();
-    return [...this.rides.values()].map(r => ({
-      rideId:    r.rideId,
-      riderId:   r.riderId,
-      driverId:  r.driverId,
-      status:    r.status,
-      rideType:  r.rideType,
-      fare:      r.finalFare?.finalFare || r.fareEstimate?.finalFare,
-      createdAt: new Date(r.createdAt).toISOString(),
-    }));
+    return pgRepo.getAllRides();
   }
 
   getStats() {
-    if (USE_PG) return pgRepo.getStats();
-
-    const rides = [...this.rides.values()];
-    const statuses = {};
-    rides.forEach(r => { statuses[r.status] = (statuses[r.status] || 0) + 1; });
-
-    const completed    = rides.filter(r => r.status === S.TRIP_COMPLETED);
-    const totalRevenue = completed.reduce((sum, r) => sum + (r.finalFare?.finalFare || 0), 0);
-    const avgMatchTime = completed.length > 0
-      ? Math.round(completed.reduce((sum, r) => sum + (r.acceptedAt - r.createdAt), 0) / completed.length / 1000)
-      : 0;
-
-    return {
-      totalRides:     rides.length,
-      statuses,
-      completedRides: completed.length,
-      totalRevenue:   `₹${totalRevenue}`,
-      avgMatchTimeSec: avgMatchTime,
-    };
+    return pgRepo.getStats();
   }
 }
 

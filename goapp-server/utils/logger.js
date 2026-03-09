@@ -64,16 +64,17 @@ class EventBus extends EventEmitter {
   }
 
   publish(eventName, data) {
+    const payload = (data && typeof data === 'object') ? data : {};
     const event = {
       id: crypto.randomUUID(),
       event: eventName,
-      data,
+      data: payload,
       timestamp: Date.now(),
       isoTime: new Date().toISOString(),
     };
     this.events.push(event);
     if (this.events.length > this.maxEvents) this.events.shift();
-    logger.event(eventName, { rideId: data.rideId, driverId: data.driverId });
+    logger.event(eventName, { rideId: payload.rideId, driverId: payload.driverId });
     this.emit(eventName, event);
     this.emit('*', event); // wildcard listener
     return event;

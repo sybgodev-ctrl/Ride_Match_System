@@ -1,11 +1,21 @@
 const { haversine, bearing } = require('../utils/formulas');
 
 function registerSystemRoutes(router, ctx) {
-  const { enterpriseConfig, repositories, services, eventBus, requireAdmin, authRuntimeStats } = ctx;
+  const { enterpriseConfig, repositories, services, eventBus, requireAdmin, requireAuth, authRuntimeStats } = ctx;
 
   function ensureAdmin(headers = {}) {
     const adminCheck = requireAdmin(headers);
     return adminCheck || null;
+  }
+
+  async function optionalSession(headers = {}) {
+    try {
+      const auth = await requireAuth(headers);
+      if (auth?.error) return null;
+      return auth?.session || null;
+    } catch (_) {
+      return null;
+    }
   }
 
   router.register('GET', '/api/v1/health', async () => ({
@@ -26,9 +36,9 @@ function registerSystemRoutes(router, ctx) {
       runtime: enterpriseConfig.runtime,
       aws: enterpriseConfig.aws,
       checks: {
-        canRunWithoutDatabase: true,
-        eventBusBuffered: true,
-        inMemoryTestDataSeeded: Boolean(services.mockDb.getStats().seedMeta),
+        dbBackend: repositories.identity.getStats?.().backend || 'unknown',
+        redisBackend: services.redis.getStats?.().backend || 'unknown',
+        realFlowMode: true,
       },
     },
   }));
@@ -139,13 +149,33 @@ function registerSystemRoutes(router, ctx) {
     return { data: result };
   });
 
-  router.register('POST', '/api/v1/fare/estimate', async ({ body }) => {
+  router.register('POST', '/api/v1/fare/estimate', async ({ body, headers }) => {
     const pickupLat = parseFloat(body?.pickupLat);
     const pickupLng = parseFloat(body?.pickupLng);
     if (!Number.isFinite(pickupLat) || !Number.isFinite(pickupLng)) {
       return { status: 400, data: { error: 'pickupLat and pickupLng must be valid coordinates' } };
     }
     const estimates = await services.pricingService.getEstimates(pickupLat, pickupLng, body?.destLat, body?.destLng);
+    const session = await optionalSession(headers || {});
+    if (session?.userId && services?.coinsService) {
+      const rideType = String(body?.rideType || '').trim().toLowerCase();
+      const patchCoinQuote = async (rideTypeName, estimate) => {
+        if (!estimate || typeof estimate !== 'object') return;
+        estimate.coins = await services.coinsService.toRideCoinsQuote(
+          session.userId,
+          Number(estimate.finalFare || 0),
+          { rideType: rideTypeName || null }
+        );
+      };
+
+      if (rideType && estimates?.estimates?.[rideType]) {
+        await patchCoinQuote(rideType, estimates.estimates[rideType]);
+      } else if (estimates?.estimates && typeof estimates.estimates === 'object') {
+        await Promise.all(
+          Object.entries(estimates.estimates).map(([key, value]) => patchCoinQuote(key, value))
+        );
+      }
+    }
     return { data: estimates };
   });
 

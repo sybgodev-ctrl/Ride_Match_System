@@ -65,7 +65,7 @@ function registerRecoveryRoutes(router, ctx) {
 
     const parsed = validateSchema(body || {}, [{ key: 'rideId', type: 'string', required: false, minLength: 2 }]);
     if (!parsed.ok) return validationError(parsed.error);
-    const result = rideSessionService.heartbeat(pathValidation.data.riderId, parsed.data.rideId || null);
+    const result = await rideSessionService.heartbeat(pathValidation.data.riderId, parsed.data.rideId || null);
     return { data: result };
   });
 }

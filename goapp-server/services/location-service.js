@@ -1,23 +1,21 @@
 // GoApp Driver Location Service
-// Manages real-time driver positions in Redis GEO.
+// Manages real-time driver positions in Redis GEO with PostGIS persistence.
 //
-// DB_BACKEND=pg  → additionally writes to PostGIS driver_locations table
-//                  (persistence + history) and falls back to PostGIS spatial
-//                  search when Redis GEO returns no results.
+// driverMeta Map is a real-time in-memory store for immediate location access
+// (interpolation, fraud detection) — NOT a mock.
+// Writes to PostGIS (driver_locations table) for persistence + history.
+// Falls back to PostGIS spatial search when Redis GEO returns no results.
 
 const redis  = require('./redis-client');
 const config = require('../config');
 const { predictLocation, detectSpoofing } = require('../utils/formulas');
 const { logger, eventBus } = require('../utils/logger');
-
-const USE_PG = config.db.backend === 'pg';
-const pgRepo = USE_PG ? require('../repositories/pg/pg-location-repository') : null;
+const pgRepo = require('../repositories/pg/pg-location-repository');
 
 const GEO_KEY = 'drivers:locations';
 const driverMeta = new Map(); // driverId -> { speed, heading, prevLocation, jumpCount, ... }
 
 // Evict stale entries every 5 minutes to prevent unbounded Map growth.
-// Entries older than maxAgeSec are considered gone and removed.
 const _evictTimer = setInterval(() => {
   const maxAgeMs = (config.scoring?.freshness?.maxAgeSec ?? 300) * 1000;
   const cutoff = Date.now() - maxAgeMs;
@@ -77,10 +75,8 @@ class LocationService {
       .catch(err => logger.warn('LOCATION', `Redis GEOADD failed (non-fatal): ${err.message}`));
 
     // ─── Persist to PostGIS (async, non-blocking) ───
-    if (USE_PG) {
-      pgRepo.recordLocation(driverId, { lat, lng, speed, heading })
-        .catch(err => logger.warn('LOCATION', `PostGIS write failed (non-fatal): ${err.message}`));
-    }
+    pgRepo.recordLocation(driverId, { lat, lng, speed, heading })
+      .catch(err => logger.warn('LOCATION', `PostGIS write failed (non-fatal): ${err.message}`));
 
     // ─── Update metadata ───
     driverMeta.set(driverId, {
@@ -147,7 +143,7 @@ class LocationService {
     });
 
     // PostGIS fallback when Redis returns nothing (e.g. Redis cleared/restart)
-    if (fresh.length === 0 && USE_PG) {
+    if (fresh.length === 0) {
       logger.info('LOCATION', `Redis GEO empty — falling back to PostGIS spatial query`);
       const pgResults = await pgRepo.findNearbyDrivers(lat, lng, radiusKm, maxCount);
       return pgResults.map(r => ({
@@ -169,7 +165,7 @@ class LocationService {
   removeDriver(driverId) {
     Promise.resolve(redis.georemove(GEO_KEY, driverId)).catch(() => {});
     driverMeta.delete(driverId);
-    if (USE_PG) pgRepo.removeDriverLocation(driverId).catch(() => {});
+    pgRepo.removeDriverLocation(driverId).catch(() => {});
     logger.info('LOCATION', `Driver ${driverId} removed from tracking`);
   }
 
@@ -194,11 +190,8 @@ class LocationService {
       trackedDrivers:  driverMeta.size,
       redisGeoMembers: redis.geoSets?.get(GEO_KEY)?.size || 0,
     };
-    if (USE_PG) {
-      const pgStats = await pgRepo.getStats().catch(() => ({}));
-      return { ...base, ...pgStats };
-    }
-    return base;
+    const pgStats = await pgRepo.getStats().catch(() => ({}));
+    return { ...base, ...pgStats };
   }
 }
 
