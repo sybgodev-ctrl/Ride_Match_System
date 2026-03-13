@@ -85,6 +85,102 @@ class PgSupportTicketRepository {
     return rows[0] || null;
   }
 
+  async listSupportPastRidesForUser(userId, { limit = 10 } = {}, client = null) {
+    const queryable = client || {
+      query: (text, params) => domainDb.query('rides', text, params, { role: 'reader', strongRead: true }),
+    };
+    const safeLimit = Math.max(1, Math.min(Number(limit) || 10, 25));
+    const terminalStatuses = ['completed', 'cancelled', 'cancelled_by_rider', 'cancelled_by_driver', 'no_drivers'];
+    const { rows } = await queryable.query(
+      `SELECT
+         r.id::text AS id,
+         r.ride_number AS "rideNumber",
+         LOWER(r.status) AS status,
+         COALESCE(r.pickup_address, req_hist."requestedPickupAddress", req_oe."requestedPickupAddress") AS "pickupAddress",
+         COALESCE(r.dropoff_address, req_hist."requestedDestAddress", req_oe."requestedDestAddress") AS "destinationAddress",
+         COALESCE(r.actual_fare, r.estimated_fare) AS fare,
+         COALESCE(rdp.vehicle_type, req_hist."requestedServiceType", req_oe."requestedServiceType", r.ride_type) AS "serviceType",
+         rdp.display_name AS "driverName",
+         rdp.vehicle_type AS "driverVehicleType",
+         rdp.vehicle_number AS "driverVehicleNumber",
+         rdp.phone_number AS "driverPhone",
+         rc."cancelledBy",
+         rc."cancellationReasonCode",
+         rc."cancellationReasonText",
+         COALESCE(r.completed_at, r.cancelled_at, r.created_at) AS "recordedAt"
+       FROM rides r
+       LEFT JOIN ride_rider_projection rrp ON rrp.rider_id = r.rider_id
+       LEFT JOIN ride_driver_projection rdp ON rdp.driver_id = r.driver_id
+       LEFT JOIN LATERAL (
+         SELECT
+           metadata->>'requestedServiceType' AS "requestedServiceType",
+           metadata->>'pickupAddress' AS "requestedPickupAddress",
+           metadata->>'destAddress' AS "requestedDestAddress"
+         FROM ride_status_history
+         WHERE ride_id = r.id
+           AND new_status = 'requested'
+         ORDER BY created_at ASC
+         LIMIT 1
+       ) req_hist ON true
+       LEFT JOIN LATERAL (
+         SELECT
+           payload->>'rideType' AS "requestedServiceType",
+           payload->>'pickupAddress' AS "requestedPickupAddress",
+           payload->>'destAddress' AS "requestedDestAddress"
+         FROM outbox_events
+         WHERE aggregate_type = 'ride'
+           AND aggregate_id = r.ride_number
+           AND topic = 'ride_requested'
+         ORDER BY created_at ASC
+         LIMIT 1
+       ) req_oe ON true
+       LEFT JOIN LATERAL (
+         SELECT
+           rc.cancelled_by AS "cancelledBy",
+           rc.reason_code AS "cancellationReasonCode",
+           rc.reason_text AS "cancellationReasonText"
+         FROM ride_cancellations rc
+         WHERE rc.ride_id = r.id
+         ORDER BY rc.cancelled_at DESC
+         LIMIT 1
+       ) rc ON true
+       WHERE rrp.user_id::text = $1
+         AND LOWER(r.status) = ANY($2::text[])
+       ORDER BY COALESCE(r.completed_at, r.cancelled_at, r.created_at) DESC, r.id DESC
+       LIMIT $3`,
+      [String(userId || '').trim(), terminalStatuses, safeLimit],
+    );
+
+    return rows.map((row) => ({
+      id: row.id,
+      rideNumber: row.rideNumber,
+      status: row.status,
+      pickupAddress: row.pickupAddress || null,
+      destinationAddress: row.destinationAddress || null,
+      fare: row.fare == null ? null : Number(row.fare),
+      serviceType: row.serviceType || null,
+      recordedAt: asDateIso(row.recordedAt),
+      driver: row.driverName || row.driverVehicleType || row.driverVehicleNumber || row.driverPhone
+        ? {
+            name: row.driverName || null,
+            vehicleType: row.driverVehicleType || null,
+            vehicleNumber: row.driverVehicleNumber || null,
+            phoneNumber: row.driverPhone || null,
+          }
+        : null,
+      cancellation: row.cancelledBy || row.cancellationReasonCode || row.cancellationReasonText || row.status !== 'completed'
+        ? {
+            cancelledBy: row.cancelledBy || (row.status === 'no_drivers' ? 'system' : null),
+            reasonCode: row.cancellationReasonCode || (row.status === 'no_drivers' ? 'no_drivers' : null),
+            reasonMessage: row.cancellationReasonText || (row.status === 'no_drivers' ? 'No driver accepted this ride.' : null),
+          }
+        : null,
+      supportEligible: true,
+      supportIneligibleReasonCode: null,
+      supportIneligibleReasonMessage: null,
+    }));
+  }
+
   async canAccessTicket(ticketId, userId, { isAdmin = false } = {}) {
     if (isAdmin) return true;
     const { rows } = await domainDb.query(
@@ -605,7 +701,7 @@ class PgSupportTicketRepository {
       params,
       { role: 'reader', strongRead: true },
     );
-    return rows.reverse().map((row) => ({
+    const messages = rows.reverse().map((row) => ({
       id: row.id,
       ticketId: row.ticketId,
       messageType: row.messageType,
@@ -618,6 +714,48 @@ class PgSupportTicketRepository {
       createdAt: asDateIso(row.createdAt),
       readByCurrentActor: row.readByCurrentActor === true,
     }));
+    const messageIds = messages.map((message) => message.id).filter(Boolean);
+    if (messageIds.length === 0) return messages;
+
+    const { rows: attachmentRows } = await domainDb.query(
+      SUPPORT_DOMAIN,
+      `SELECT
+         id,
+         ticket_id::text AS "ticketId",
+         message_id::text AS "messageId",
+         original_name AS "originalName",
+         mime_type AS "mimeType",
+         size_bytes AS "sizeBytes",
+         checksum_sha256 AS "checksumSha256"
+       FROM support_ticket_attachments
+       WHERE ticket_id::text = $1
+         AND message_id = ANY($2::uuid[])
+       ORDER BY created_at ASC, id ASC`,
+      [String(ticketId || '').trim(), messageIds],
+      { role: 'reader', strongRead: true },
+    );
+    const attachmentsByMessageId = new Map();
+    for (const row of attachmentRows) {
+      const list = attachmentsByMessageId.get(row.messageId) || [];
+      list.push(toAttachment(row, row.ticketId));
+      attachmentsByMessageId.set(row.messageId, list);
+    }
+
+    return messages.map((message) => {
+      const persisted = attachmentsByMessageId.get(message.id) || [];
+      if (persisted.length === 0) return message;
+      const merged = [...persisted];
+      const seenKeys = new Set(persisted.map((attachment) => attachment.id || attachment.downloadUrl || attachment.fileName));
+      for (const attachment of message.attachments || []) {
+        const key = attachment?.id || attachment?.downloadUrl || attachment?.fileName;
+        if (key && seenKeys.has(key)) continue;
+        merged.push(attachment);
+      }
+      return {
+        ...message,
+        attachments: merged,
+      };
+    });
   }
 
   async listAdminTickets({ status = null, category = null, priority = null, agentId = null, limit = 50 } = {}) {
@@ -800,7 +938,13 @@ class PgSupportTicketRepository {
     }));
   }
 
-  async getPastRideIssueGroupById(groupId) {
+  async getPastRideIssueGroupById(groupId, { activeOnly = false } = {}) {
+    const params = [String(groupId || '').trim()];
+    let whereSql = 'WHERE id::text = $1';
+    if (activeOnly) {
+      params.push(true);
+      whereSql += ` AND is_active = $${params.length}`;
+    }
     const { rows } = await domainDb.query(
       SUPPORT_DOMAIN,
       `SELECT
@@ -812,12 +956,44 @@ class PgSupportTicketRepository {
          sort_order AS "sortOrder",
          is_active AS "isActive"
        FROM support_trip_issue_groups
-       WHERE id::text = $1
+       ${whereSql}
        LIMIT 1`,
-      [String(groupId || '').trim()],
+      params,
       { role: 'reader', strongRead: true },
     );
     return rows[0] || null;
+  }
+
+  async listPastRideSubIssuesByIds(subIssueIds, { activeOnly = false } = {}) {
+    const normalizedIds = Array.from(new Set(
+      Array.isArray(subIssueIds)
+        ? subIssueIds.map((value) => String(value || '').trim()).filter(Boolean)
+        : [],
+    ));
+    if (normalizedIds.length === 0) return [];
+
+    const params = [normalizedIds];
+    let whereSql = 'WHERE id::text = ANY($1::text[])';
+    if (activeOnly) {
+      params.push(true);
+      whereSql += ` AND is_active = $${params.length}`;
+    }
+    const { rows } = await domainDb.query(
+      SUPPORT_DOMAIN,
+      `SELECT
+         id,
+         group_id AS "groupId",
+         title,
+         description,
+         sort_order AS "sortOrder",
+         is_active AS "isActive"
+       FROM support_trip_issue_subissues
+       ${whereSql}
+       ORDER BY sort_order ASC, created_at ASC`,
+      params,
+      { role: 'reader', strongRead: true },
+    );
+    return rows;
   }
 
   async createPastRideIssueGroup(client, payload) {

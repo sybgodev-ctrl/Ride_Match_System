@@ -31,29 +31,37 @@ const SUPPORT_SECTION_TREE = Object.freeze([
     id: 'fare_issues',
     title: 'Fare Issues',
     description: 'Help with charges, estimates, and route-related fare disputes.',
+    iconKey: 'receipt',
+    routeKey: 'fare_issues',
     backendCategory: 'fare_issue',
-    children: [],
+    items: [],
   },
   {
     id: 'driver_vehicle_issues',
     title: 'Driver or Vehicle Issues',
     description: 'Report driver, vehicle, or ride conduct issues.',
+    iconKey: 'driver',
+    routeKey: 'driver_vehicle_issues',
     backendCategory: 'driver_vehicle_issue',
-    children: [],
+    items: [],
   },
   {
     id: 'payment_related_issues',
     title: 'Payment Related Issues',
     description: 'Wallet, payment, and coins support requests.',
+    iconKey: 'wallet',
+    routeKey: 'payment_related_issues',
     backendCategory: 'payment_wallet_issue',
-    children: [],
+    items: [],
   },
   {
     id: 'other_help',
     title: 'Other Help',
     description: 'App, referral, account, and general support.',
+    iconKey: 'help',
+    routeKey: 'other_help',
     backendCategory: 'general_support',
-    children: [],
+    items: [],
   },
 ]);
 const RATE_LIMITS = {
@@ -126,7 +134,47 @@ class SupportTicketService {
   }
 
   getSupportSections() {
-    return SUPPORT_SECTION_TREE;
+    return SUPPORT_SECTION_TREE.map((section) => {
+      const items = Array.isArray(section.items) ? section.items.map((item) => ({ ...item })) : [];
+      return {
+        id: section.id,
+        title: section.title,
+        description: section.description || '',
+        iconKey: section.iconKey || 'help',
+        routeKey: section.routeKey || section.id,
+        backendCategory: section.backendCategory,
+        items,
+        // Preserve the legacy key during rollout.
+        children: items,
+      };
+    });
+  }
+
+  async listSupportPastRides(userId, { limit = 10 } = {}) {
+    const rides = await this.repository.listSupportPastRidesForUser(userId, { limit });
+    return {
+      success: true,
+      message: 'Support past rides loaded successfully.',
+      data: {
+        rides: rides.map((ride) => ({
+          id: ride.id,
+          rideNumber: ride.rideNumber,
+          status: ride.status,
+          pickupAddress: ride.pickupAddress || null,
+          destinationAddress: ride.destinationAddress || null,
+          fare: ride.fare ?? null,
+          serviceType: ride.driver?.vehicleType || ride.serviceType || null,
+          recordedAt: ride.recordedAt || null,
+          driver: ride.driver || null,
+          cancellation: ride.cancellation || null,
+          support: {
+            eligible: ride.supportEligible !== false,
+            ineligibleReasonCode: ride.supportIneligibleReasonCode || null,
+            ineligibleReasonMessage: ride.supportIneligibleReasonMessage || null,
+          },
+        })),
+      },
+    };
   }
 
   async listPastRideIssueCatalog({ activeOnly = true } = {}) {
@@ -296,18 +344,29 @@ class SupportTicketService {
     message,
     priority = 'normal',
     rideId = null,
+    issueGroupId = null,
+    issueSubIssueIds = [],
     metadata = {},
     files = [],
     idempotencyKey = null,
     requestId = null,
     ip = '',
   }) {
-    const normalizedCategory = this._normalizeCategory(category);
+    const requestedCategory = String(category || '').trim() ? this._normalizeCategory(category) : null;
     const normalizedPriority = String(priority || 'normal').trim().toLowerCase();
     const normalizedSubject = String(subject || '').trim();
     const normalizedMessage = String(message || '').trim();
     const normalizedRideId = String(rideId || '').trim() || null;
+    const normalizedIssueGroupId = String(issueGroupId || '').trim() || null;
+    const normalizedIssueSubIssueIds = Array.from(new Set(
+      Array.isArray(issueSubIssueIds)
+        ? issueSubIssueIds.map((value) => String(value || '').trim()).filter(Boolean)
+        : [],
+    ));
     const normalizedMetadata = metadata && typeof metadata === 'object' ? metadata : {};
+    let normalizedCategory = requestedCategory;
+    let issueGroup = null;
+    let selectedSubIssues = [];
 
     this._log('SUPPORT_TICKET_CREATE_ATTEMPT', {
       requestId,
@@ -315,11 +374,46 @@ class SupportTicketService {
       actorRole: 'user',
       actorType: userType,
       category: normalizedCategory,
+      issueGroupId: normalizedIssueGroupId,
+      issueSubIssueCount: normalizedIssueSubIssueIds.length,
       attachmentCount: Array.isArray(files) ? files.length : 0,
       ip,
     });
 
-    if (!TICKET_CATEGORIES.has(normalizedCategory)) {
+    if (normalizedIssueGroupId) {
+      issueGroup = await this.repository.getPastRideIssueGroupById(normalizedIssueGroupId, { activeOnly: true });
+      if (!issueGroup) {
+        return this._error('SUPPORT_TRIP_ISSUE_GROUP_NOT_FOUND', 'Past ride issue group not found.', { status: 404 });
+      }
+      if (!normalizedRideId) {
+        return this._error('SUPPORT_RIDE_REQUIRED', 'Ride is required for past ride support.', { status: 400 });
+      }
+      const derivedCategory = this._normalizeCategory(issueGroup.backendCategory);
+      if (normalizedCategory && normalizedCategory !== derivedCategory) {
+        return this._error(
+          'SUPPORT_TRIP_ISSUE_CATEGORY_MISMATCH',
+          'Selected issue group does not match the requested support category.',
+          { status: 400 },
+        );
+      }
+      normalizedCategory = derivedCategory;
+      if (normalizedIssueSubIssueIds.length) {
+        selectedSubIssues = await this.repository.listPastRideSubIssuesByIds(normalizedIssueSubIssueIds, { activeOnly: true });
+        if (selectedSubIssues.length !== normalizedIssueSubIssueIds.length) {
+          return this._error('SUPPORT_TRIP_SUB_ISSUE_NOT_FOUND', 'One or more selected sub-issues were not found.', { status: 404 });
+        }
+        const hasMismatchedParent = selectedSubIssues.some((subIssue) => String(subIssue.groupId) !== String(normalizedIssueGroupId));
+        if (hasMismatchedParent) {
+          return this._error(
+            'SUPPORT_TRIP_SUB_ISSUE_GROUP_MISMATCH',
+            'Selected sub-issues do not belong to the selected main issue.',
+            { status: 400 },
+          );
+        }
+      }
+    }
+
+    if (!normalizedCategory || !TICKET_CATEGORIES.has(normalizedCategory)) {
       return this._error('SUPPORT_INVALID_CATEGORY', 'Invalid ticket category.');
     }
     if (!VALID_PRIORITIES.has(normalizedPriority)) {
@@ -330,6 +424,9 @@ class SupportTicketService {
     }
     if (Array.isArray(files) && files.length > RATE_LIMITS.attachmentCount) {
       return this._error('SUPPORT_ATTACHMENT_LIMIT_EXCEEDED', 'Too many attachments.');
+    }
+    if (Array.isArray(files) && files.length > 0 && !this.storageService) {
+      return this._error('SUPPORT_ATTACHMENT_STORAGE_UNAVAILABLE', 'Support attachment storage is unavailable.', { status: 503 });
     }
 
     const rateLimit = await this._applyRateLimit(`support:create:${userId}`, RATE_LIMITS.createPerMinute, 60);
@@ -388,6 +485,20 @@ class SupportTicketService {
           description: normalizedMessage,
           metadata: {
             ...normalizedMetadata,
+            ...(issueGroup
+              ? {
+                  pastRideIssueSelection: {
+                    issueGroupId: issueGroup.id,
+                    issueGroupTitle: issueGroup.title,
+                    issueBackendCategory: issueGroup.backendCategory,
+                    issueSubIssueIds: selectedSubIssues.map((subIssue) => subIssue.id),
+                    issueSubIssues: selectedSubIssues.map((subIssue) => ({
+                      id: subIssue.id,
+                      title: subIssue.title,
+                    })),
+                  },
+                }
+              : {}),
             ...(rideSnapshot ? { rideSnapshot } : {}),
           },
         });
@@ -687,6 +798,12 @@ class SupportTicketService {
     if (!normalizedContent) {
       return this._error('SUPPORT_MESSAGE_EMPTY', 'Message content is required.');
     }
+    if (Array.isArray(payload.files) && payload.files.length > RATE_LIMITS.attachmentCount) {
+      return this._error('SUPPORT_ATTACHMENT_LIMIT_EXCEEDED', 'Too many attachments.');
+    }
+    if (Array.isArray(payload.files) && payload.files.length > 0 && !this.storageService) {
+      return this._error('SUPPORT_ATTACHMENT_STORAGE_UNAVAILABLE', 'Support attachment storage is unavailable.', { status: 503 });
+    }
     const idempotencyScope = payload.idempotencyKey && this.redis
       ? `support:message:${payload.actorId}:${ticketId}:${payload.idempotencyKey}`
       : null;
@@ -718,6 +835,25 @@ class SupportTicketService {
         } else if (ticket.status === 'PENDING_USER') {
           nextStatus = 'IN_PROGRESS';
         }
+        const attachments = [];
+        for (const file of payload.files || []) {
+          const validated = this._validateAttachment(file);
+          if (!validated.ok) {
+            throw Object.assign(new Error(validated.message), { supportCode: validated.code, supportStatus: validated.status || 400 });
+          }
+          const stored = await this.storageService.save(ticketId, file.filename, file.data);
+          attachments.push({
+            storageBackend: stored.storageBackend,
+            storageKey: stored.storageKey,
+            originalName: stored.originalName,
+            safeName: stored.safeName,
+            mimeType: file.mimeType,
+            sizeBytes: stored.sizeBytes,
+            checksumSha256: stored.checksumSha256,
+            uploadedBy: payload.actorId,
+            scanStatus: 'not_scanned',
+          });
+        }
         const messageId = await this.repository.createMessage(client, {
           ticketId,
           senderId: payload.actorId,
@@ -727,8 +863,22 @@ class SupportTicketService {
           content: normalizedContent,
           messageType: payload.isAdmin ? 'agent' : 'user',
           visibility: payload.visibility || 'public',
-          attachments: [],
+          attachments: attachments.map((attachment) => ({
+            id: null,
+            fileName: attachment.originalName,
+            mimeType: attachment.mimeType,
+            sizeBytes: attachment.sizeBytes,
+            checksum: attachment.checksumSha256,
+            downloadUrl: null,
+          })),
         });
+        for (const attachment of attachments) {
+          await this.repository.createAttachment(client, {
+            ticketId,
+            messageId,
+            ...attachment,
+          });
+        }
         if (nextStatus !== ticket.status) {
           await this.repository.updateTicketState(client, {
             ticketId,
