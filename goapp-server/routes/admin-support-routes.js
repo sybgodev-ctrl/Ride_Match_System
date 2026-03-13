@@ -61,7 +61,7 @@ function registerAdminSupportRoutes(router, ctx) {
     return { data: result };
   });
 
-  router.register('POST', '/api/v1/admin/tickets/:ticketId/messages', async ({ pathParams, body, headers }) => {
+  router.register('POST', '/api/v1/admin/tickets/:ticketId/messages', async ({ pathParams, body, headers, files }) => {
     const admin = ensureAdmin(headers);
     if (admin) return admin;
     const parsed = validateSchema(body, [
@@ -77,6 +77,9 @@ function registerAdminSupportRoutes(router, ctx) {
       requestUserReply: body?.requestUserReply === true,
       requestId: headers?.['x-request-id'] || null,
       idempotencyKey: String(headers?.['idempotency-key'] || headers?.['x-idempotency-key'] || '').trim() || null,
+      files: Array.isArray(files)
+        ? files.filter((file) => ['attachment', 'attachments', 'file'].includes(file.fieldName))
+        : [],
     });
     if (!result.success) {
       return buildErrorFromResult(result, {

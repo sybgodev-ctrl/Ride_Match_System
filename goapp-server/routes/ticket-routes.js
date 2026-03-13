@@ -17,6 +17,28 @@ function parseJsonObject(raw) {
   }
 }
 
+function parseStringArray(raw) {
+  if (raw == null || raw === '') return [];
+  if (Array.isArray(raw)) {
+    return raw.map((value) => String(value || '').trim()).filter(Boolean);
+  }
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return parsed.map((value) => String(value || '').trim()).filter(Boolean);
+      }
+    } catch (_) {
+      // Fall through to delimited/single-value parsing.
+    }
+    return String(raw)
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean);
+  }
+  return [String(raw).trim()].filter(Boolean);
+}
+
 function registerTicketRoutes(router, ctx) {
   const { requireAuth, services } = ctx;
   const ticketService = services.ticketService;
@@ -30,15 +52,29 @@ function registerTicketRoutes(router, ctx) {
     return { data: result };
   });
 
+  router.register('GET', '/api/v1/support/past-rides', async ({ params, headers }) => {
+    const auth = await getAuthenticatedSession(requireAuth, headers);
+    if (auth.error) return auth.error;
+
+    const limitParsed = parseQueryNumber(params, 'limit', { min: 1, max: 25, fallback: 10 });
+    if (!limitParsed.ok) return validationError(limitParsed.error);
+
+    const result = await ticketService.listSupportPastRides(auth.session.userId, {
+      limit: limitParsed.value,
+    });
+    return { data: result };
+  });
+
   router.register('POST', '/api/v1/tickets', async ({ body, headers, files, ip }) => {
     const auth = await getAuthenticatedSession(requireAuth, headers);
     if (auth.error) return auth.error;
 
     const parsed = validateSchema(body, [
-      { key: 'category', type: 'string', required: true, maxLength: 64 },
+      { key: 'category', type: 'string', required: false, maxLength: 64 },
       { key: 'subject', type: 'string', required: true, minLength: 3, maxLength: 300 },
       { key: 'message', type: 'string', required: true, minLength: 2, maxLength: 5000 },
       { key: 'rideId', type: 'string', required: false, maxLength: 255 },
+      { key: 'issueGroupId', type: 'string', required: false, maxLength: 64 },
       { key: 'priority', type: 'string', required: false, enum: ['low', 'normal', 'high', 'urgent'] },
     ]);
     if (!parsed.ok) return validationError(parsed.error);
@@ -46,10 +82,12 @@ function registerTicketRoutes(router, ctx) {
     const result = await ticketService.createTicket({
       userId: auth.session.userId,
       userType: 'rider',
-      category: parsed.data.category,
+      category: parsed.data.category || null,
       subject: parsed.data.subject,
       message: parsed.data.message,
       rideId: parsed.data.rideId || null,
+      issueGroupId: parsed.data.issueGroupId || body?.issue_group_id || null,
+      issueSubIssueIds: parseStringArray(body?.issueSubIssueIds || body?.issue_sub_issue_ids),
       priority: parsed.data.priority || 'normal',
       metadata: parseJsonObject(body?.metadata),
       files: Array.isArray(files)
@@ -121,7 +159,7 @@ function registerTicketRoutes(router, ctx) {
     return { data: result };
   });
 
-  router.register('POST', '/api/v1/tickets/:ticketId/messages', async ({ pathParams, body, headers }) => {
+  router.register('POST', '/api/v1/tickets/:ticketId/messages', async ({ pathParams, body, headers, files }) => {
     const auth = await getAuthenticatedSession(requireAuth, headers);
     if (auth.error) return auth.error;
 
@@ -137,6 +175,9 @@ function registerTicketRoutes(router, ctx) {
       requestId: headers?.['x-request-id'] || null,
       isAdmin: false,
       visibility: 'public',
+      files: Array.isArray(files)
+        ? files.filter((file) => ['attachment', 'attachments', 'file'].includes(file.fieldName))
+        : [],
     });
     if (!result.success) {
       return buildErrorFromResult(result, {
